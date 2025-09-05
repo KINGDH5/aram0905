@@ -115,7 +115,7 @@ class CompMLP_Exact(nn.Module):
         return self.mlp(x).squeeze(-1)
 
 def _infer_model_from_state(sd):
-    # 임베딩 모양
+    # --- 임베딩 모양 ---
     n_champ, d_champ = sd["emb_champ.weight"].shape
     n_sp, d_sp   = sd["emb_sp.weight"].shape
     n_pri, d_pri = sd["emb_pri.weight"].shape
@@ -123,22 +123,46 @@ def _infer_model_from_state(sd):
     n_key, d_key = sd["emb_key.weight"].shape
     n_pat, d_pat = sd["emb_pat.weight"].shape
 
-    # MLP 크기/드롭아웃 여부
+    # --- MLP 크기/드롭아웃 여부 ---
     in_dim = sd["mlp.0.weight"].shape[1]
     h1     = sd["mlp.0.weight"].shape[0]
     use_dropout = ("mlp.3.weight" in sd and "mlp.2.weight" not in sd)
     h2 = sd["mlp.3.weight"].shape[0] if use_dropout else sd["mlp.2.weight"].shape[0]
 
-    # 총 챔피언 임베딩 슬롯수 = (in_dim - misc합) / d_champ
+    # misc 임베딩 총합
     misc_sum = d_sp + d_pri + d_sub + d_key + d_pat
-    total_slots = (in_dim - misc_sum) // d_champ  # me + allies + enemies
-    allies = 4
-    enemies = max(total_slots - 1 - allies, 0)
-    return dict(n_champ=n_champ, d_champ=d_champ,
-                n_sp=n_sp, d_sp=d_sp, n_pri=n_pri, d_pri=d_pri, n_sub=n_sub, d_sub=d_sub,
-                n_key=n_key, d_key=d_key, n_pat=n_pat, d_pat=d_pat,
-                in_dim=in_dim, h1=h1, h2=h2, use_dropout=use_dropout,
-                allies=allies, enemies=enemies)
+
+    # ---- allies/enemies 자동 탐색 ----
+    # 보통 allies=4가 일반적이므로 그쪽을 가산점 주고, '정확히 in_dim 일치'하는 조합만 채택
+    best = None
+    for allies in range(0, 6):        # 0~5
+        for enemies in range(0, 10):  # 0~9
+            expect = d_champ * (1 + allies + enemies) + misc_sum
+            if expect == in_dim:
+                # allies=4에 가산점, 그 외 동일하면 더 큰 enemies 우선 같은 단순 점수
+                score = -abs(allies - 4) * 10 + enemies
+                cand = (score, allies, enemies)
+                if best is None or cand > best:
+                    best = cand
+
+    if best is None:
+        # 폴백: 총 슬롯 역산(정확 일치 조합을 못 찾았을 때)
+        total_slots = (in_dim - misc_sum) // d_champ
+        allies = 4
+        enemies = max(total_slots - 1 - allies, 0)
+    else:
+        allies = best[1]
+        enemies = best[2]
+
+    return dict(
+        n_champ=n_champ, d_champ=d_champ,
+        n_sp=n_sp, d_sp=d_sp, n_pri=n_pri, d_pri=d_pri,
+        n_sub=n_sub, d_sub=d_sub, n_key=n_key, d_key=d_key,
+        n_pat=n_pat, d_pat=d_pat,
+        in_dim=in_dim, h1=h1, h2=h2, use_dropout=use_dropout,
+        allies=allies, enemies=enemies
+    )
+
 
 def enc_misc_row(enc: OrdinalEncoder, row: dict):
     vals = [[
