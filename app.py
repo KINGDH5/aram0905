@@ -166,20 +166,24 @@ class CompMLP(nn.Module):
 def load_model(local_path: str):
     if not os.path.exists(local_path):
         return None
-    obj = torch.load(local_path, map_location="cpu")
+    # 중요: weights_only=False (객체 포함 체크포인트를 읽기 위해 필요)
+    obj = torch.load(local_path, map_location="cpu", weights_only=False)
     state_dict   = obj["state_dict"]
     champ_id2idx = obj["champ_id2idx"]
-    enc_misc     = obj["enc_misc"]   # OrdinalEncoder pickled state
+    enc_misc     = obj["enc_misc"]
     meta         = obj.get("meta", {"dim_champ":64,"dim_misc":16})
+
     n_sp  = len(enc_misc.categories_[0])
     n_pri = len(enc_misc.categories_[1])
     n_sub = len(enc_misc.categories_[2])
     n_key = len(enc_misc.categories_[3])
     n_pat = len(enc_misc.categories_[4])
+
     model = CompMLP(n_champ=len(champ_id2idx), dim_champ=meta["dim_champ"],
                     n_misc_cards=(n_sp,n_pri,n_sub,n_key,n_pat), dim_misc=meta["dim_misc"])
     model.load_state_dict(state_dict); model.eval()
     return {"model": model, "champ_id2idx": champ_id2idx, "enc_misc": enc_misc}
+
 
 def encode_misc(enc_misc: OrdinalEncoder, row_dict: dict):
     X = pd.DataFrame([row_dict], columns=["spell_pair","primaryStyle","subStyle","keystone","patch"])
