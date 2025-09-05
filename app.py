@@ -1,10 +1,17 @@
 # app.py
 # ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP) + 스크린샷 인식(β)
 
-import os, io, json, requests, numpy as np, pandas as pd, streamlit as st, torch
+import os, io, re, json, requests, numpy as np, pandas as pd, streamlit as st, torch
 import torch.nn as nn
 from sklearn.preprocessing import OrdinalEncoder
 from PIL import Image
+
+# gdown (있으면 사용, 없으면 requests 폴백)
+try:
+    import gdown
+    HAS_GDOWN = True
+except Exception:
+    HAS_GDOWN = False
 
 # PyTorch가 sklearn 객체를 안전 로드할 수 있게 등록
 from torch.serialization import add_safe_globals
@@ -17,7 +24,7 @@ st.title("🎯 ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP)")
 # 기본 설정
 # ------------------------------------------------------------------
 LANG = "ko_KR"
-LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포에 파일 없으면 MODEL_URL에서 받아옴
+LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포에 없으면 MODEL_URL로 다운로드
 os.makedirs("model", exist_ok=True)
 
 # ------------------------------------------------------------------
@@ -36,7 +43,7 @@ def load_champion_static(lang=LANG):
     url = f"https://ddragon.leagueoflegends.com/cdn/{ver}/data/{lang}/champion.json"
     data = requests.get(url, timeout=20).json()["data"]
     rows = []
-    for k, v in data.items():
+    for _, v in data.items():
         rows.append({
             "championId": int(v["key"]),
             "name": v["name"],
@@ -96,62 +103,109 @@ class CompMLP_Exact(nn.Module):
             )
 
     def forward(self, my_idx, ally_lists, enem_lists, misc_idx):
-    # ----- 임베딩 모음 -----
-    me = self.emb_champ(my_idx)  # [B, d_champ]
+        # ----- 임베딩 모음 -----
+        me = self.emb_champ(my_idx)  # [B, d_champ]
 
-    # allies/enemies 개수 정확히 맞추기(패딩/트렁케이트)
-    allies = [self.emb_champ(a) for a in ally_lists[: self.n_allies]]
-    for _ in range(max(0, self.n_allies - len(allies))):
-        allies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
+        # allies/enemies 개수 정확히 맞추기(패딩/트렁케이트)
+        allies = [self.emb_champ(a) for a in ally_lists[: self.n_allies]]
+        for _ in range(max(0, self.n_allies - len(allies))):
+            allies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
 
-    enemies = [self.emb_champ(e) for e in enem_lists[: self.n_enemies]]
-    for _ in range(max(0, self.n_enemies - len(enemies))):
-        enemies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
+        enemies = [self.emb_champ(e) for e in enem_lists[: self.n_enemies]]
+        for _ in range(max(0, self.n_enemies - len(enemies))):
+            enemies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
 
-    # misc 5종(순서 고정)
-    sp  = self.emb_sp(misc_idx[:, 0])
-    pri = self.emb_pri(misc_idx[:, 1])
-    sub = self.emb_sub(misc_idx[:, 2])
-    key = self.emb_key(misc_idx[:, 3])
-    pat = self.emb_pat(misc_idx[:, 4])
-    misc = torch.cat([sp, pri, sub, key, pat], dim=-1)  # [B, misc_sum]
+        # misc 5종(순서 고정)
+        sp  = self.emb_sp(misc_idx[:, 0])
+        pri = self.emb_pri(misc_idx[:, 1])
+        sub = self.emb_sub(misc_idx[:, 2])
+        key = self.emb_key(misc_idx[:, 3])
+        pat = self.emb_pat(misc_idx[:, 4])
+        misc = torch.cat([sp, pri, sub, key, pat], dim=-1)  # [B, misc_sum]
 
-    # ----- 실제 입력 벡터 -----
-    x = torch.cat([me, *allies, *enemies, misc], dim=-1)  # [B, cur_dim]
+        # ----- 실제 입력 벡터 -----
+        x = torch.cat([me, *allies, *enemies, misc], dim=-1)  # [B, cur_dim]
 
-    # ===== 안전 가드: in_features와 정확히 맞추기 =====
-    try:
-        first_linear = self.mlp[0]            # nn.Linear
-        expect = int(first_linear.in_features)
-    except Exception:
-        # 드문 케이스: 드롭아웃 유무에 따라 index가 달라졌을 때
-        for mod in self.mlp:
-            if isinstance(mod, torch.nn.Linear):
-                expect = int(mod.in_features)
-                break
+        # ===== 안전 가드: in_features와 정확히 맞추기 =====
+        try:
+            first_linear = self.mlp[0]            # nn.Linear
+            expect = int(first_linear.in_features)
+        except Exception:
+            # 드롭아웃 유무에 따른 인덱스 차이를 대비해 첫 Linear를 탐색
+            expect = None
+            for mod in self.mlp:
+                if isinstance(mod, torch.nn.Linear):
+                    expect = int(mod.in_features)
+                    break
 
-    cur = int(x.size(-1))
-    if cur != expect:
-        # 디버그: 한 번만 경고(시끄럽지 않게)
-        if not hasattr(self, "_dim_warned"):
-            import streamlit as st
-            st.warning(
-                f"[입력 차원 자동 보정] cur_dim={cur}, expect={expect} "
-                f"(allies={self.n_allies}, enemies={self.n_enemies})"
-            )
-            self._dim_warned = True
+        if expect is not None:
+            cur = int(x.size(-1))
+            if cur != expect:
+                # 디버그: 한 번만 경고
+                if not hasattr(self, "_dim_warned"):
+                    import streamlit as st
+                    st.warning(
+                        f"[입력 차원 자동 보정] cur_dim={cur}, expect={expect} "
+                        f"(allies={self.n_allies}, enemies={self.n_enemies})"
+                    )
+                    self._dim_warned = True
 
-        if cur < expect:
-            # 부족하면 뒤쪽을 0으로 패딩
-            pad = torch.zeros(x.size(0), expect - cur, device=x.device, dtype=x.dtype)
-            x = torch.cat([x, pad], dim=-1)
-        else:
-            # 넘치면 뒷부분 잘라서 맞춤
-            x = x[..., :expect]
+                if cur < expect:
+                    # 부족 → 0 패딩
+                    pad = torch.zeros(x.size(0), expect - cur, device=x.device, dtype=x.dtype)
+                    x = torch.cat([x, pad], dim=-1)
+                else:
+                    # 넘침 → 잘라내기
+                    x = x[..., :expect]
 
-    # ----- MLP 통과 -----
-    return self.mlp(x).squeeze(-1)
+        # ----- MLP 통과 -----
+        return self.mlp(x).squeeze(-1)
 
+def _infer_model_from_state(sd):
+    # --- 임베딩 모양 ---
+    n_champ, d_champ = sd["emb_champ.weight"].shape
+    n_sp, d_sp   = sd["emb_sp.weight"].shape
+    n_pri, d_pri = sd["emb_pri.weight"].shape
+    n_sub, d_sub = sd["emb_sub.weight"].shape
+    n_key, d_key = sd["emb_key.weight"].shape
+    n_pat, d_pat = sd["emb_pat.weight"].shape
+
+    # --- MLP 크기/드롭아웃 ---
+    in_dim = sd["mlp.0.weight"].shape[1]
+    h1     = sd["mlp.0.weight"].shape[0]
+    use_dropout = ("mlp.3.weight" in sd and "mlp.2.weight" not in sd)
+    h2 = sd["mlp.3.weight"].shape[0] if use_dropout else sd["mlp.2.weight"].shape[0]
+
+    misc_sum = d_sp + d_pri + d_sub + d_key + d_pat
+
+    # ---- allies/enemies 자동 탐색 (정확히 in_dim 일치) ----
+    best = None
+    for allies in range(0, 6):        # 0~5
+        for enemies in range(0, 10):  # 0~9
+            expect = d_champ * (1 + allies + enemies) + misc_sum
+            if expect == in_dim:
+                # allies=4 선호, 같으면 enemies 큰 쪽
+                score = -abs(allies - 4) * 10 + enemies
+                cand = (score, allies, enemies)
+                if best is None or cand > best:
+                    best = cand
+    if best is None:
+        # 폴백: 총 슬롯 역산
+        total_slots = (in_dim - misc_sum) // d_champ
+        allies = 4
+        enemies = max(total_slots - 1 - allies, 0)
+    else:
+        allies = best[1]
+        enemies = best[2]
+
+    return dict(
+        n_champ=n_champ, d_champ=d_champ,
+        n_sp=n_sp, d_sp=d_sp, n_pri=n_pri, d_pri=d_pri,
+        n_sub=n_sub, d_sub=d_sub, n_key=n_key, d_key=d_key,
+        n_pat=n_pat, d_pat=d_pat,
+        in_dim=in_dim, h1=h1, h2=h2, use_dropout=use_dropout,
+        allies=allies, enemies=enemies
+    )
 
 def enc_misc_row(enc: OrdinalEncoder, row: dict):
     vals = [[
@@ -167,24 +221,61 @@ def enc_misc_row(enc: OrdinalEncoder, row: dict):
             arr[0, j] = len(enc.categories_[j])  # UNK = 마지막 인덱스
     return torch.tensor(arr, dtype=torch.long)
 
+# ---- Google Drive 헬퍼 ----
+def _extract_drive_file_id(url: str) -> str | None:
+    if not url:
+        return None
+    for pat in [r"/d/([A-Za-z0-9_-]{10,})", r"[?&]id=([A-Za-z0-9_-]{10,})"]:
+        m = re.search(pat, url)
+        if m:
+            return m.group(1)
+    return None
+
 def ensure_model_file(local_path: str, url: str):
-    if os.path.exists(local_path): return local_path
-    if not url: return None
-    try:
-        with requests.get(url, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            with open(local_path, "wb") as f:
-                for chunk in r.iter_content(8192):
-                    if chunk: f.write(chunk)
+    if os.path.exists(local_path):
         return local_path
+    if not url:
+        return None
+
+    fid = _extract_drive_file_id(url)
+
+    try:
+        if fid and HAS_GDOWN:
+            gdown.download(f"https://drive.google.com/uc?id={fid}", local_path, quiet=False)
+        else:
+            dl_url = f"https://drive.google.com/uc?id={fid}&confirm=t" if fid else url
+            with requests.get(dl_url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(local_path, "wb") as f:
+                    for chunk in r.iter_content(1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
     except Exception as e:
         st.error(f"모델 다운로드 실패: {e}")
         return None
 
+    # 파일 검증: HTML 받았는지 체크
+    try:
+        with open(local_path, "rb") as f:
+            head = f.read(32)
+        if head.strip().startswith(b"<"):
+            raise ValueError("다운로드된 내용이 HTML입니다. 드라이브 공유 설정 또는 링크를 확인하세요.")
+    except Exception as e:
+        st.error(f"모델 파일 검증 실패: {e}")
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
+        return None
+
+    return local_path
+
 @st.cache_resource(show_spinner=True)
 def load_model(local_path: str):
-    if not os.path.exists(local_path): return None
-    obj = torch.load(local_path, map_location="cpu", weights_only=False)  # sklearn 포함
+    if not os.path.exists(local_path):
+        return None
+    # sklearn 객체 포함 → weights_only=False
+    obj = torch.load(local_path, map_location="cpu", weights_only=False)
 
     state_dict   = obj["state_dict"]
     champ_id2idx = obj["champ_id2idx"]
@@ -211,7 +302,6 @@ def get_bundle():
             with open(LOCAL_MODEL_PATH, "rb") as f:
                 head = f.read(32)
             if head.strip().startswith(b"<"):
-                # 예전 실패로 HTML이 저장되어 있던 케이스 → 삭제
                 os.remove(LOCAL_MODEL_PATH)
         except Exception:
             pass
@@ -223,7 +313,6 @@ def get_bundle():
             if b:
                 return b
         except Exception as e:
-            # 깨진 파일이면 지우고 URL 재시도
             try:
                 os.remove(LOCAL_MODEL_PATH)
             except Exception:
@@ -236,8 +325,8 @@ def get_bundle():
         url = st.secrets["MODEL_URL"].strip()
 
     if url:
-        dl_path = LOCAL_MODEL_PATH   # 항상 같은 경로로 저장
-        path = ensure_model_file(dl_path, url)  # 이 함수는 그대로 사용해도 됨
+        dl_path = LOCAL_MODEL_PATH
+        path = ensure_model_file(dl_path, url)
         if path:
             try:
                 b = load_model(path)
@@ -273,16 +362,20 @@ def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
             ids.append(0)
         return ids
 
-    # ✨ 여기! 1차원 [1] 텐서로 만듭니다 (예전 코드의 [[...]] 때문에 [1,1]이 됨)
-    my = torch.tensor([c2i.get(int(my_cid), unk_idx)], dtype=torch.long).to(device)           # shape [1]
-
-    ally = torch.tensor([c2i.get(i, unk_idx) for i in pad(ally_ids, na)], dtype=torch.long)   # shape [na]
+    # 1차원 [1] 텐서
+    my = torch.tensor([c2i.get(int(my_cid), unk_idx)], dtype=torch.long).to(device)  # [1]
+    ally = torch.tensor([c2i.get(i, unk_idx) for i in pad(ally_ids, na)], dtype=torch.long)  # [na]
     ally = ally.unsqueeze(0).to(device)  # [1, na]
-
-    enem = torch.tensor([c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)], dtype=torch.long)  # shape [ne]
+    enem = torch.tensor([c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)], dtype=torch.long) # [ne]
     enem = enem.unsqueeze(0).to(device)  # [1, ne]
+    misc = enc_misc_row(enc, misc_row).to(device)                                           # [1, 5]
 
-    misc = enc_misc_row(enc, misc_row).to(device)                                             # [1, 5]
+    # 디버그(원하면 주석 해제)
+    # if st.session_state.get("_shape_logged") is not True:
+    #     st.caption(f"[DBG] allies={na}, enemies={ne}, "
+    #                f"champ_dim={model.emb_champ.embedding_dim}, "
+    #                f"misc_dim={model.emb_sp.embedding_dim + model.emb_pri.embedding_dim + model.emb_sub.embedding_dim + model.emb_key.embedding_dim + model.emb_pat.embedding_dim}")
+    #     st.session_state["_shape_logged"] = True
 
     with torch.no_grad():
         out = model(
@@ -294,6 +387,7 @@ def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
         prob = torch.sigmoid(out).cpu().item()
 
     return float(prob)
+
 # ------------------------------------------------------------------
 # 내 전적 CSV 로드
 # ------------------------------------------------------------------
@@ -468,7 +562,6 @@ def init_vertex():
         st.error(f"Vertex AI 라이브러리가 없습니다: {e}")
         return None
 
-    # --- Secrets 읽기 ---
     proj = st.secrets.get("GCP_PROJECT", "")
     loc  = st.secrets.get("GCP_LOCATION", "us-central1")
     sa   = st.secrets.get("GCP_SA_JSON", "")
@@ -476,18 +569,15 @@ def init_vertex():
         st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
         return None
 
-    # 서비스 계정 키 파일 저장
     key_path = "/tmp/gcp_key.json"
     with open(key_path, "w", encoding="utf-8") as f:
         f.write(sa)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
 
-    # Vertex 초기화
     import vertexai
     vertexai.init(project=proj, location=loc)
     from vertexai.generative_models import GenerativeModel
 
-    # 모델 후보: Secrets 우선 → 폴백
     prefer = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash-002")
     candidates = [
         prefer,
@@ -509,7 +599,7 @@ def init_vertex():
             continue
 
     st.error(f"Gemini 모델 접근 실패: {last_err}")
-    st.info("• Vertex AI Studio 약관 동의/리전(us-central1)/권한(roles:aiplatform.user)을 다시 확인하세요.")
+    st.info("• Vertex AI Studio 약관 동의/리전(us-central1)/권한(roles:aiplatform.user) 확인.")
     return None
 
 def _names_to_ids(names):
@@ -521,7 +611,8 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     st.image(img, caption="입력 이미지", use_container_width=True)
 
     model = init_vertex()
-    if model is None: st.stop()
+    if model is None:
+        st.stop()
 
     from vertexai.generative_models import Part
     sys_prompt = (
