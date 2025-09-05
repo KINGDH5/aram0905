@@ -222,36 +222,45 @@ else:      st.sidebar.error("모델 미로딩 ❌")
 
 def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
     """체크포인트가 기대하는 allies/enemies 개수에 맞춰 패딩/트렁케이트"""
-    if bundle is None: return 0.5
+    if bundle is None:
+        return 0.5
+
     model = bundle["model"]
     c2i   = bundle["champ_id2idx"]
     enc   = bundle["enc_misc"]
-    na = bundle.get("allies", 4)
-    ne = bundle.get("enemies", 5)
+    na    = bundle.get("allies", 4)
+    ne    = bundle.get("enemies", 5)
 
     device = torch.device("cpu")
     unk_idx = len(c2i)  # 미등록 id → 마지막 인덱스 사용
 
     def pad(ids, need):
         ids = [int(x) for x in ids][:need]
-        while len(ids) < need: ids.append(0)
+        while len(ids) < need:
+            ids.append(0)
         return ids
 
-    my = torch.tensor([[c2i.get(int(my_cid), unk_idx)]], dtype=torch.long).to(device)
-    ally = torch.tensor([[c2i.get(i, unk_idx) for i in pad(ally_ids, na)]], dtype=torch.long).to(device)
-    enem = torch.tensor([[c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)]], dtype=torch.long).to(device)
-    misc = enc_misc_row(enc, misc_row).to(device)
+    # ✨ 여기! 1차원 [1] 텐서로 만듭니다 (예전 코드의 [[...]] 때문에 [1,1]이 됨)
+    my = torch.tensor([c2i.get(int(my_cid), unk_idx)], dtype=torch.long).to(device)           # shape [1]
+
+    ally = torch.tensor([c2i.get(i, unk_idx) for i in pad(ally_ids, na)], dtype=torch.long)   # shape [na]
+    ally = ally.unsqueeze(0).to(device)  # [1, na]
+
+    enem = torch.tensor([c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)], dtype=torch.long)  # shape [ne]
+    enem = enem.unsqueeze(0).to(device)  # [1, ne]
+
+    misc = enc_misc_row(enc, misc_row).to(device)                                             # [1, 5]
 
     with torch.no_grad():
         out = model(
-            my,
-            [ally[:, i] for i in range(ally.shape[1])],
-            [enem[:, i] for i in range(enem.shape[1])],
-            misc
+            my,                               # [1]
+            [ally[:, i] for i in range(ally.shape[1])],   # 각 원소는 [1]
+            [enem[:, i] for i in range(enem.shape[1])],   # 각 원소는 [1]
+            misc                              # [1, 5]
         )
         prob = torch.sigmoid(out).cpu().item()
-    return float(prob)
 
+    return float(prob)
 # ------------------------------------------------------------------
 # 내 전적 CSV 로드
 # ------------------------------------------------------------------
