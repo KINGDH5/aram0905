@@ -1,40 +1,27 @@
 # app.py
 # ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP) + 스크린샷 인식(β)
-# ------------------------------------------------------------------
-# 사전 준비 (Streamlit Cloud)
-# 1) requirements.txt 에 포함:
-#    streamlit
-#    torch
-#    pandas
-#    numpy
-#    requests
-#    scikit-learn
-#    pillow
-#    google-cloud-aiplatform
-# 2) Secrets (Manage app → Settings → Secrets):
-#    MODEL_URL    = "https://drive.google.com/uc?export=download&id=YOUR_FILE_ID"
-#    GCP_PROJECT  = "elite-crossbar-471202-p5"        # 예시: 네 Project ID
-#    GCP_LOCATION = "us-central1"
-#    GCP_SA_JSON  = """{ ...서비스계정 키 JSON 전체... }"""
-# ------------------------------------------------------------------
 
 import os, io, json, requests, numpy as np, pandas as pd, streamlit as st, torch
 import torch.nn as nn
 from sklearn.preprocessing import OrdinalEncoder
+from PIL import Image
 
-# PyTorch 피클 안전목록에 sklearn 객체 등록 (체크포인트 로드용)
+# PyTorch가 sklearn 객체를 안전 로드할 수 있게 등록
 from torch.serialization import add_safe_globals
 add_safe_globals([OrdinalEncoder])
 
 st.set_page_config(page_title="ARAM 픽창 개인화 추천", page_icon="🎯", layout="wide")
 st.title("🎯 ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP)")
 
+# ------------------------------------------------------------------
+# 기본 설정
+# ------------------------------------------------------------------
 LANG = "ko_KR"
-LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포 내 파일이 깨졌으면 이름 바꿔도 OK
+LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포에 파일 없으면 MODEL_URL에서 받아옴
 os.makedirs("model", exist_ok=True)
 
 # ------------------------------------------------------------------
-# Data Dragon: 챔피언 메타 정보
+# Data Dragon 챔피언 정적 정보
 # ------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def ddragon_latest_version():
@@ -67,7 +54,7 @@ def load_champion_static(lang=LANG):
 champ_df, id2name, id2icon, id2tags, name2id = load_champion_static()
 
 # ------------------------------------------------------------------
-# 체크포인트 모양을 그대로 복원하는 모델 로더 (크기 mismatch 방지)  ← ★핵심 패치
+# 체크포인트 모양을 그대로 복원하는 모델 로더 (크기 mismatch 방지)
 # ------------------------------------------------------------------
 class CompMLP_Exact(nn.Module):
     """
@@ -89,7 +76,7 @@ class CompMLP_Exact(nn.Module):
         self.n_allies = allies
         self.n_enemies = enemies
 
-        # MLP (드롭아웃 유무는 ckpt 키로 판별)
+        # MLP
         if use_dropout:
             self.mlp = nn.Sequential(
                 nn.Linear(in_dim, h1),  # 0
@@ -113,7 +100,6 @@ class CompMLP_Exact(nn.Module):
         allies = [self.emb_champ(a) for a in ally_lists[:self.n_allies]]
         for _ in range(max(0, self.n_allies - len(allies))):
             allies.append(self.emb_champ(torch.zeros_like(my_idx)))
-
         enemies = [self.emb_champ(e) for e in enem_lists[:self.n_enemies]]
         for _ in range(max(0, self.n_enemies - len(enemies))):
             enemies.append(self.emb_champ(torch.zeros_like(my_idx)))
@@ -123,8 +109,8 @@ class CompMLP_Exact(nn.Module):
         sub = self.emb_sub(misc_idx[:,2])
         key = self.emb_key(misc_idx[:,3])
         pat = self.emb_pat(misc_idx[:,4])
-
         misc = torch.cat([sp, pri, sub, key, pat], dim=-1)
+
         x = torch.cat([me, *allies, *enemies, misc], dim=-1)
         return self.mlp(x).squeeze(-1)
 
@@ -185,7 +171,7 @@ def ensure_model_file(local_path: str, url: str):
 @st.cache_resource(show_spinner=True)
 def load_model(local_path: str):
     if not os.path.exists(local_path): return None
-    obj = torch.load(local_path, map_location="cpu", weights_only=False)  # sklearn 객체 포함
+    obj = torch.load(local_path, map_location="cpu", weights_only=False)  # sklearn 포함
 
     state_dict   = obj["state_dict"]
     champ_id2idx = obj["champ_id2idx"]
@@ -432,8 +418,6 @@ if st.button("🚀 추천 실행"):
 st.markdown("---")
 st.header("🖼️ 픽창 스크린샷으로 자동 추천 (β)")
 
-from PIL import Image
-
 def init_vertex():
     try:
         import vertexai
@@ -441,22 +425,52 @@ def init_vertex():
     except Exception as e:
         st.error(f"Vertex AI 라이브러리가 없습니다: {e}")
         return None
+
+    # --- Secrets 읽기 ---
     proj = st.secrets.get("GCP_PROJECT", "")
     loc  = st.secrets.get("GCP_LOCATION", "us-central1")
     sa   = st.secrets.get("GCP_SA_JSON", "")
     if not (proj and sa):
         st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
         return None
+
+    # 서비스 계정 키 파일 저장
     key_path = "/tmp/gcp_key.json"
-    with open(key_path, "w", encoding="utf-8") as f: f.write(sa)
+    with open(key_path, "w", encoding="utf-8") as f:
+        f.write(sa)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
 
+    # Vertex 초기화
     import vertexai
     vertexai.init(project=proj, location=loc)
     from vertexai.generative_models import GenerativeModel
-    return GenerativeModel("gemini-1.5-flash")
 
-def _names_to_ids(names):  # Korean name → champId
+    # 모델 후보: Secrets 우선 → 폴백
+    prefer = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash-002")
+    candidates = [
+        prefer,
+        "gemini-2.5-flash-lite-001",
+        "gemini-2.0-flash-001",
+        "gemini-1.5-flash-002",
+        "gemini-1.0-pro-vision-001",
+    ]
+
+    last_err = None
+    for m in candidates:
+        try:
+            model = GenerativeModel(m)
+            _ = model.generate_content(["ping"], generation_config={"max_output_tokens": 1})
+            st.caption(f"Using Gemini model: **{m}**")
+            return model
+        except Exception as e:
+            last_err = e
+            continue
+
+    st.error(f"Gemini 모델 접근 실패: {last_err}")
+    st.info("• Vertex AI Studio 약관 동의/리전(us-central1)/권한(roles:aiplatform.user)을 다시 확인하세요.")
+    return None
+
+def _names_to_ids(names):
     return [int(name2id[n]) for n in names if n in name2id]
 
 up_img = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"])
