@@ -370,13 +370,6 @@ def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
     enem = enem.unsqueeze(0).to(device)  # [1, ne]
     misc = enc_misc_row(enc, misc_row).to(device)                                           # [1, 5]
 
-    # 디버그(원하면 주석 해제)
-    # if st.session_state.get("_shape_logged") is not True:
-    #     st.caption(f"[DBG] allies={na}, enemies={ne}, "
-    #                f"champ_dim={model.emb_champ.embedding_dim}, "
-    #                f"misc_dim={model.emb_sp.embedding_dim + model.emb_pri.embedding_dim + model.emb_sub.embedding_dim + model.emb_key.embedding_dim + model.emb_pat.embedding_dim}")
-    #     st.session_state["_shape_logged"] = True
-
     with torch.no_grad():
         out = model(
             my,                               # [1]
@@ -564,14 +557,21 @@ def init_vertex():
 
     proj = st.secrets.get("GCP_PROJECT", "")
     loc  = st.secrets.get("GCP_LOCATION", "us-central1")
-    sa   = st.secrets.get("GCP_SA_JSON", "")
-    if not (proj and sa):
+    sa_raw = st.secrets.get("GCP_SA_JSON", "")
+    if not (proj and sa_raw):
         st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
+        return None
+
+    # 시크릿 문자열은 이미 \\n 이스케이프가 들어간 유효한 JSON이어야 함
+    try:
+        sa_obj = json.loads(sa_raw)
+    except Exception as e:
+        st.error(f"GCP_SA_JSON 파싱 실패: {e}")
         return None
 
     key_path = "/tmp/gcp_key.json"
     with open(key_path, "w", encoding="utf-8") as f:
-        f.write(sa)
+        json.dump(sa_obj, f)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
 
     import vertexai
@@ -579,19 +579,17 @@ def init_vertex():
     from vertexai.generative_models import GenerativeModel
 
     prefer = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash-002")
-    candidates = [
-        prefer,
-        "gemini-2.5-flash-lite-001",
-        "gemini-2.0-flash-001",
-        "gemini-1.5-flash-002",
-        "gemini-1.0-pro-vision-001",
-    ]
+    candidates = [prefer, "gemini-2.5-flash-lite-001", "gemini-2.0-flash-001",
+                  "gemini-1.5-flash-002", "gemini-1.0-pro-vision-001"]
 
     last_err = None
+    # ✅ 모델 헬스체크: 텍스트만 한 토큰 요청
     for m in candidates:
         try:
             model = GenerativeModel(m)
-            _ = model.generate_content(["ping"], generation_config={"max_output_tokens": 1})
+            test = model.generate_content(["ping"], generation_config={"max_output_tokens": 1})
+            if not getattr(test, "candidates", None):
+                raise RuntimeError("모델 응답이 비어있음")
             st.caption(f"Using Gemini model: **{m}**")
             return model
         except Exception as e:
@@ -599,7 +597,7 @@ def init_vertex():
             continue
 
     st.error(f"Gemini 모델 접근 실패: {last_err}")
-    st.info("• Vertex AI Studio 약관 동의/리전(us-central1)/권한(roles:aiplatform.user) 확인.")
+    st.info("• 프로젝트/리전(us-central1)/역할(roles:aiplatform.user)/결제 활성화 여부를 확인하세요.")
     return None
 
 def _names_to_ids(names):
@@ -630,14 +628,45 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     )
     buf = io.BytesIO(); img.save(buf, format="PNG")
 
+    resp = model.generate_content(
+        [sys_prompt, Part.from_data(mime_type="image/png", data=buf.getvalue()), user_prompt],
+        generation_config={"temperature": 0.1, "max_output_tokens": 512},
+    )
+
+    # ---- 응답 문자열 안전 추출 ----
+    raw = ""
+    if hasattr(resp, "text") and resp.text:
+        raw = resp.text
+    elif getattr(resp, "candidates", None):
+        parts = []
+        for c in resp.candidates:
+            try:
+                # content.parts[*].text 에 있을 수 있음
+                for p in getattr(c, "content", {}).parts or []:
+                    if getattr(p, "text", None):
+                        parts.append(p.text)
+            except Exception:
+                pass
+        raw = "\n".join([p for p in parts if p])
+    raw = (raw or "").strip()
+
+    if not raw:
+        st.error("모델 응답이 비었습니다. (인증/권한/리전/모델명을 다시 확인)")
+        st.stop()
+
+    # ---- JSON만 추출 (코드블럭/앞뒤 텍스트 섞여도 OK) ----
+    m = re.search(r"\{[\s\S]*\}", raw)
+    if not m:
+        st.error("응답에서 JSON 블록을 찾지 못했습니다. 프롬프트를 다시 보내 보세요.")
+        st.code(raw, language="markdown")
+        st.stop()
+
+    json_str = m.group(0)
     try:
-        resp = model.generate_content(
-            [sys_prompt, Part.from_data(mime_type="image/png", data=buf.getvalue()), user_prompt],
-            generation_config={"temperature": 0.1, "max_output_tokens": 512},
-        )
-        data = json.loads(resp.text.strip())
+        data = json.loads(json_str)
     except Exception as e:
-        st.error(f"인식 실패: {e}")
+        st.error(f"JSON 파싱 실패: {e}")
+        st.code(json_str, language="json")
         st.stop()
 
     st.subheader("인식 결과")
