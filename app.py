@@ -96,72 +96,61 @@ class CompMLP_Exact(nn.Module):
             )
 
     def forward(self, my_idx, ally_lists, enem_lists, misc_idx):
-        me = self.emb_champ(my_idx)
-        allies = [self.emb_champ(a) for a in ally_lists[:self.n_allies]]
-        for _ in range(max(0, self.n_allies - len(allies))):
-            allies.append(self.emb_champ(torch.zeros_like(my_idx)))
-        enemies = [self.emb_champ(e) for e in enem_lists[:self.n_enemies]]
-        for _ in range(max(0, self.n_enemies - len(enemies))):
-            enemies.append(self.emb_champ(torch.zeros_like(my_idx)))
+    # ----- 임베딩 모음 -----
+    me = self.emb_champ(my_idx)  # [B, d_champ]
 
-        sp  = self.emb_sp(misc_idx[:,0])
-        pri = self.emb_pri(misc_idx[:,1])
-        sub = self.emb_sub(misc_idx[:,2])
-        key = self.emb_key(misc_idx[:,3])
-        pat = self.emb_pat(misc_idx[:,4])
-        misc = torch.cat([sp, pri, sub, key, pat], dim=-1)
+    # allies/enemies 개수 정확히 맞추기(패딩/트렁케이트)
+    allies = [self.emb_champ(a) for a in ally_lists[: self.n_allies]]
+    for _ in range(max(0, self.n_allies - len(allies))):
+        allies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
 
-        x = torch.cat([me, *allies, *enemies, misc], dim=-1)
-        return self.mlp(x).squeeze(-1)
+    enemies = [self.emb_champ(e) for e in enem_lists[: self.n_enemies]]
+    for _ in range(max(0, self.n_enemies - len(enemies))):
+        enemies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
 
-def _infer_model_from_state(sd):
-    # --- 임베딩 모양 ---
-    n_champ, d_champ = sd["emb_champ.weight"].shape
-    n_sp, d_sp   = sd["emb_sp.weight"].shape
-    n_pri, d_pri = sd["emb_pri.weight"].shape
-    n_sub, d_sub = sd["emb_sub.weight"].shape
-    n_key, d_key = sd["emb_key.weight"].shape
-    n_pat, d_pat = sd["emb_pat.weight"].shape
+    # misc 5종(순서 고정)
+    sp  = self.emb_sp(misc_idx[:, 0])
+    pri = self.emb_pri(misc_idx[:, 1])
+    sub = self.emb_sub(misc_idx[:, 2])
+    key = self.emb_key(misc_idx[:, 3])
+    pat = self.emb_pat(misc_idx[:, 4])
+    misc = torch.cat([sp, pri, sub, key, pat], dim=-1)  # [B, misc_sum]
 
-    # --- MLP 크기/드롭아웃 여부 ---
-    in_dim = sd["mlp.0.weight"].shape[1]
-    h1     = sd["mlp.0.weight"].shape[0]
-    use_dropout = ("mlp.3.weight" in sd and "mlp.2.weight" not in sd)
-    h2 = sd["mlp.3.weight"].shape[0] if use_dropout else sd["mlp.2.weight"].shape[0]
+    # ----- 실제 입력 벡터 -----
+    x = torch.cat([me, *allies, *enemies, misc], dim=-1)  # [B, cur_dim]
 
-    # misc 임베딩 총합
-    misc_sum = d_sp + d_pri + d_sub + d_key + d_pat
+    # ===== 안전 가드: in_features와 정확히 맞추기 =====
+    try:
+        first_linear = self.mlp[0]            # nn.Linear
+        expect = int(first_linear.in_features)
+    except Exception:
+        # 드문 케이스: 드롭아웃 유무에 따라 index가 달라졌을 때
+        for mod in self.mlp:
+            if isinstance(mod, torch.nn.Linear):
+                expect = int(mod.in_features)
+                break
 
-    # ---- allies/enemies 자동 탐색 ----
-    # 보통 allies=4가 일반적이므로 그쪽을 가산점 주고, '정확히 in_dim 일치'하는 조합만 채택
-    best = None
-    for allies in range(0, 6):        # 0~5
-        for enemies in range(0, 10):  # 0~9
-            expect = d_champ * (1 + allies + enemies) + misc_sum
-            if expect == in_dim:
-                # allies=4에 가산점, 그 외 동일하면 더 큰 enemies 우선 같은 단순 점수
-                score = -abs(allies - 4) * 10 + enemies
-                cand = (score, allies, enemies)
-                if best is None or cand > best:
-                    best = cand
+    cur = int(x.size(-1))
+    if cur != expect:
+        # 디버그: 한 번만 경고(시끄럽지 않게)
+        if not hasattr(self, "_dim_warned"):
+            import streamlit as st
+            st.warning(
+                f"[입력 차원 자동 보정] cur_dim={cur}, expect={expect} "
+                f"(allies={self.n_allies}, enemies={self.n_enemies})"
+            )
+            self._dim_warned = True
 
-    if best is None:
-        # 폴백: 총 슬롯 역산(정확 일치 조합을 못 찾았을 때)
-        total_slots = (in_dim - misc_sum) // d_champ
-        allies = 4
-        enemies = max(total_slots - 1 - allies, 0)
-    else:
-        allies = best[1]
-        enemies = best[2]
+        if cur < expect:
+            # 부족하면 뒤쪽을 0으로 패딩
+            pad = torch.zeros(x.size(0), expect - cur, device=x.device, dtype=x.dtype)
+            x = torch.cat([x, pad], dim=-1)
+        else:
+            # 넘치면 뒷부분 잘라서 맞춤
+            x = x[..., :expect]
 
-    return dict(
-        n_champ=n_champ, d_champ=d_champ,
-        n_sp=n_sp, d_sp=d_sp, n_pri=n_pri, d_pri=d_pri,
-        n_sub=n_sub, d_sub=d_sub, n_key=n_key, d_key=d_key,
-        n_pat=n_pat, d_pat=d_pat,
-        in_dim=in_dim, h1=h1, h2=h2, use_dropout=use_dropout,
-        allies=allies, enemies=enemies
-    )
+    # ----- MLP 통과 -----
+    return self.mlp(x).squeeze(-1)
 
 
 def enc_misc_row(enc: OrdinalEncoder, row: dict):
