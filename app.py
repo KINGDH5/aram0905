@@ -1,47 +1,45 @@
 # app.py
 # ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP) + 스크린샷 인식(β)
-# ---------------------------------------------------------------
-# 사용법
-# 1) 사이드바에서 내 전적 CSV 업로드(또는 RAW URL)
-# 2) [픽창 입력] 탭에서 아군4/상대(선택)/후보 입력 → 추천 실행
-# 3) [스크린샷(β)] 탭에서 픽창 스샷 업로드 → 자동 인식 & 추천
-#
-# 사전 준비
-# - requirements.txt: streamlit, torch, pandas, numpy, requests, scikit-learn, pillow, google-cloud-aiplatform
-# - Secrets (Streamlit Cloud):
-#     MODEL_URL = "https://drive.google.com/uc?export=download&id=......"
-#     GCP_PROJECT  = "elite-crossbar-471202-p5"
-#     GCP_LOCATION = "us-central1"
-#     GCP_SA_JSON  = """{ ... 서비스계정 키 JSON 전체 ... }"""
-# ---------------------------------------------------------------
+# ------------------------------------------------------------------
+# 사전 준비 (Streamlit Cloud)
+# 1) requirements.txt 에 포함:
+#    streamlit
+#    torch
+#    pandas
+#    numpy
+#    requests
+#    scikit-learn
+#    pillow
+#    google-cloud-aiplatform
+# 2) Secrets (Manage app → Settings → Secrets):
+#    MODEL_URL    = "https://drive.google.com/uc?export=download&id=YOUR_FILE_ID"
+#    GCP_PROJECT  = "elite-crossbar-471202-p5"        # 예시: 네 Project ID
+#    GCP_LOCATION = "us-central1"
+#    GCP_SA_JSON  = """{ ...서비스계정 키 JSON 전체... }"""
+# ------------------------------------------------------------------
 
-import os, io, json, time, math, requests
-import numpy as np
-import pandas as pd
-import streamlit as st
-import torch
+import os, io, json, requests, numpy as np, pandas as pd, streamlit as st, torch
 import torch.nn as nn
 from sklearn.preprocessing import OrdinalEncoder
 
-# PyTorch 보안 로드(피클 안전 목록) – 체크포인트에 포함된 sklearn 객체 허용
+# PyTorch 피클 안전목록에 sklearn 객체 등록 (체크포인트 로드용)
 from torch.serialization import add_safe_globals
 add_safe_globals([OrdinalEncoder])
 
 st.set_page_config(page_title="ARAM 픽창 개인화 추천", page_icon="🎯", layout="wide")
 st.title("🎯 ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP)")
 
-# ------------------------------------------------------------------
-# 설정
-# ------------------------------------------------------------------
 LANG = "ko_KR"
-LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"   # 레포에 깨진 pt가 있으면 다른 이름으로 바꿔도 됨
+LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포 내 파일이 깨졌으면 이름 바꿔도 OK
 os.makedirs("model", exist_ok=True)
 
+# ------------------------------------------------------------------
+# Data Dragon: 챔피언 메타 정보
+# ------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def ddragon_latest_version():
     try:
-        v = requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=10).json()[0]
-        return v
+        return requests.get("https://ddragon.leagueoflegends.com/api/versions.json", timeout=10).json()[0]
     except Exception:
         return "14.14.1"
 
@@ -69,37 +67,58 @@ def load_champion_static(lang=LANG):
 champ_df, id2name, id2icon, id2tags, name2id = load_champion_static()
 
 # ------------------------------------------------------------------
-# 모델 정의 & 유틸
+# 체크포인트 모양을 그대로 복원하는 모델 로더 (크기 mismatch 방지)  ← ★핵심 패치
 # ------------------------------------------------------------------
-class CompMLP(nn.Module):
-    def __init__(self, n_champ, dim_champ=64, n_misc_cards=(64,64,64,64,64), dim_misc=16, hidden=128):
+class CompMLP_Exact(nn.Module):
+    """
+    체크포인트(state_dict)에서 임베딩/레이어 차원을 읽어 '그대로' 복원.
+    allies/enemies 슬롯 개수도 입력차원에서 역산.
+    """
+    def __init__(self, n_champ, d_champ,
+                 n_sp, d_sp, n_pri, d_pri, n_sub, d_sub, n_key, d_key, n_pat, d_pat,
+                 in_dim, h1, h2, use_dropout, allies, enemies):
         super().__init__()
-        self.emb_champ = nn.Embedding(n_champ+1, dim_champ)  # 마지막 인덱스=UNK
-        sp, pri, sub, key, pat = n_misc_cards
-        self.emb_sp  = nn.Embedding(sp+1, 8)   # +1 for UNK
-        self.emb_pri = nn.Embedding(pri+1, 8)
-        self.emb_sub = nn.Embedding(sub+1, 8)
-        self.emb_key = nn.Embedding(key+1, 8)
-        self.emb_pat = nn.Embedding(pat+1, 4)
+        # Embeddings
+        self.emb_champ = nn.Embedding(n_champ, d_champ)
+        self.emb_sp  = nn.Embedding(n_sp,  d_sp)
+        self.emb_pri = nn.Embedding(n_pri, d_pri)
+        self.emb_sub = nn.Embedding(n_sub, d_sub)
+        self.emb_key = nn.Embedding(n_key, d_key)
+        self.emb_pat = nn.Embedding(n_pat, d_pat)
 
-        in_dim = dim_champ*(1+4+5) + (8+8+8+8+4)  # me + 4 ally + 5 enemy + misc
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(hidden, hidden//2),
-            nn.ReLU(),
-            nn.Linear(hidden//2, 1),
-        )
+        self.n_allies = allies
+        self.n_enemies = enemies
+
+        # MLP (드롭아웃 유무는 ckpt 키로 판별)
+        if use_dropout:
+            self.mlp = nn.Sequential(
+                nn.Linear(in_dim, h1),  # 0
+                nn.ReLU(),              # 1
+                nn.Dropout(0.2),        # 2
+                nn.Linear(h1, h2),      # 3
+                nn.ReLU(),              # 4
+                nn.Linear(h2, 1),       # 5
+            )
+        else:
+            self.mlp = nn.Sequential(
+                nn.Linear(in_dim, h1),  # 0
+                nn.ReLU(),              # 1
+                nn.Linear(h1, h2),      # 2
+                nn.ReLU(),              # 3
+                nn.Linear(h2, 1),       # 4
+            )
 
     def forward(self, my_idx, ally_lists, enem_lists, misc_idx):
-        # 챔피언 임베딩
-        me = self.emb_champ(my_idx)  # [B, D]
-        allies = [self.emb_champ(a) for a in ally_lists]  # 4 * [B, D]
-        enemies = [self.emb_champ(e) for e in enem_lists] # 5 * [B, D] (빈 자리 0 또는 UNK로 채움)
+        me = self.emb_champ(my_idx)
+        allies = [self.emb_champ(a) for a in ally_lists[:self.n_allies]]
+        for _ in range(max(0, self.n_allies - len(allies))):
+            allies.append(self.emb_champ(torch.zeros_like(my_idx)))
 
-        # misc: [B, 5]
-        sp = self.emb_sp(misc_idx[:,0])
+        enemies = [self.emb_champ(e) for e in enem_lists[:self.n_enemies]]
+        for _ in range(max(0, self.n_enemies - len(enemies))):
+            enemies.append(self.emb_champ(torch.zeros_like(my_idx)))
+
+        sp  = self.emb_sp(misc_idx[:,0])
         pri = self.emb_pri(misc_idx[:,1])
         sub = self.emb_sub(misc_idx[:,2])
         key = self.emb_key(misc_idx[:,3])
@@ -107,15 +126,35 @@ class CompMLP(nn.Module):
 
         misc = torch.cat([sp, pri, sub, key, pat], dim=-1)
         x = torch.cat([me, *allies, *enemies, misc], dim=-1)
-        out = self.mlp(x).squeeze(-1)
-        return out
+        return self.mlp(x).squeeze(-1)
 
-def tensorize_ids(id_list, champ_id2idx, unk_idx):
-    idxs = [champ_id2idx.get(int(i), unk_idx) for i in id_list]
-    return torch.tensor([idxs], dtype=torch.long)
+def _infer_model_from_state(sd):
+    # 임베딩 모양
+    n_champ, d_champ = sd["emb_champ.weight"].shape
+    n_sp, d_sp   = sd["emb_sp.weight"].shape
+    n_pri, d_pri = sd["emb_pri.weight"].shape
+    n_sub, d_sub = sd["emb_sub.weight"].shape
+    n_key, d_key = sd["emb_key.weight"].shape
+    n_pat, d_pat = sd["emb_pat.weight"].shape
+
+    # MLP 크기/드롭아웃 여부
+    in_dim = sd["mlp.0.weight"].shape[1]
+    h1     = sd["mlp.0.weight"].shape[0]
+    use_dropout = ("mlp.3.weight" in sd and "mlp.2.weight" not in sd)
+    h2 = sd["mlp.3.weight"].shape[0] if use_dropout else sd["mlp.2.weight"].shape[0]
+
+    # 총 챔피언 임베딩 슬롯수 = (in_dim - misc합) / d_champ
+    misc_sum = d_sp + d_pri + d_sub + d_key + d_pat
+    total_slots = (in_dim - misc_sum) // d_champ  # me + allies + enemies
+    allies = 4
+    enemies = max(total_slots - 1 - allies, 0)
+    return dict(n_champ=n_champ, d_champ=d_champ,
+                n_sp=n_sp, d_sp=d_sp, n_pri=n_pri, d_pri=d_pri, n_sub=n_sub, d_sub=d_sub,
+                n_key=n_key, d_key=d_key, n_pat=n_pat, d_pat=d_pat,
+                in_dim=in_dim, h1=h1, h2=h2, use_dropout=use_dropout,
+                allies=allies, enemies=enemies)
 
 def enc_misc_row(enc: OrdinalEncoder, row: dict):
-    # enc.categories_ 순서: [spell_pair, primaryStyle, subStyle, keystone, patch]
     vals = [[
         row.get("spell_pair", "__UNK__"),
         row.get("primaryStyle", "__UNK__"),
@@ -124,38 +163,10 @@ def enc_misc_row(enc: OrdinalEncoder, row: dict):
         row.get("patch", "__UNK__"),
     ]]
     arr = enc.transform(vals).astype(int)  # -1 포함 가능
-    # -1 → 해당 카드의 UNK(=last index)로 치환
     for j in range(arr.shape[1]):
         if arr[0, j] < 0:
-            arr[0, j] = len(enc.categories_[j])  # 마지막 인덱스가 UNK
+            arr[0, j] = len(enc.categories_[j])  # UNK = 마지막 인덱스
     return torch.tensor(arr, dtype=torch.long)
-
-@st.cache_resource(show_spinner=True)
-def load_model(local_path: str):
-    if not os.path.exists(local_path):
-        return None
-    # 객체 포함 체크포인트 → weights_only=False
-    obj = torch.load(local_path, map_location="cpu", weights_only=False)
-    state_dict   = obj["state_dict"]
-    champ_id2idx = obj["champ_id2idx"]
-    enc_misc     = obj["enc_misc"]
-    meta = obj.get("meta", {"dim_champ":64, "dim_misc":16})
-
-    n_sp  = len(enc_misc.categories_[0])
-    n_pri = len(enc_misc.categories_[1])
-    n_sub = len(enc_misc.categories_[2])
-    n_key = len(enc_misc.categories_[3])
-    n_pat = len(enc_misc.categories_[4])
-
-    model = CompMLP(
-        n_champ=len(champ_id2idx),
-        dim_champ=meta["dim_champ"],
-        n_misc_cards=(n_sp, n_pri, n_sub, n_key, n_pat),
-        dim_misc=meta["dim_misc"]
-    )
-    model.load_state_dict(state_dict)
-    model.eval()
-    return {"model": model, "champ_id2idx": champ_id2idx, "enc_misc": enc_misc}
 
 def ensure_model_file(local_path: str, url: str):
     if os.path.exists(local_path): return local_path
@@ -164,7 +175,7 @@ def ensure_model_file(local_path: str, url: str):
         with requests.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
             with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                for chunk in r.iter_content(8192):
                     if chunk: f.write(chunk)
         return local_path
     except Exception as e:
@@ -172,8 +183,30 @@ def ensure_model_file(local_path: str, url: str):
         return None
 
 @st.cache_resource(show_spinner=True)
+def load_model(local_path: str):
+    if not os.path.exists(local_path): return None
+    obj = torch.load(local_path, map_location="cpu", weights_only=False)  # sklearn 객체 포함
+
+    state_dict   = obj["state_dict"]
+    champ_id2idx = obj["champ_id2idx"]
+    enc_misc     = obj["enc_misc"]
+
+    spec = _infer_model_from_state(state_dict)
+    model = CompMLP_Exact(
+        spec["n_champ"], spec["d_champ"],
+        spec["n_sp"], spec["d_sp"], spec["n_pri"], spec["d_pri"],
+        spec["n_sub"], spec["d_sub"], spec["n_key"], spec["d_key"],
+        spec["n_pat"], spec["d_pat"], spec["in_dim"], spec["h1"],
+        spec["h2"], spec["use_dropout"], spec["allies"], spec["enemies"]
+    )
+    model.load_state_dict(state_dict)
+    model.eval()
+    return {"model": model, "champ_id2idx": champ_id2idx, "enc_misc": enc_misc,
+            "allies": spec["allies"], "enemies": spec["enemies"]}
+
+@st.cache_resource(show_spinner=True)
 def get_bundle():
-    # 1) 로컬 경로 우선
+    # 1) 로컬 우선
     if os.path.exists(LOCAL_MODEL_PATH):
         try:
             b = load_model(LOCAL_MODEL_PATH)
@@ -181,7 +214,7 @@ def get_bundle():
         except Exception as e:
             st.warning(f"로컬 모델 로드 실패, URL 재시도: {e}")
 
-    # 2) Secrets / env 의 MODEL_URL에서 받기
+    # 2) Secrets/ENV의 MODEL_URL
     url = os.environ.get("MODEL_URL", "")
     if not url and "MODEL_URL" in st.secrets:
         url = st.secrets["MODEL_URL"].strip()
@@ -194,17 +227,47 @@ def get_bundle():
                 if b: return b
             except Exception as e:
                 st.error(f"다운로드 모델 로드 실패: {e}")
-    st.error("모델 준비 실패(로컬 파일 없음 & MODEL_URL 미설정)")
+    st.error("모델 준비 실패 (로컬 파일 없음 & MODEL_URL 미설정)")
     return None
 
 bundle = get_bundle()
-if bundle is not None:
-    st.sidebar.success("모델 준비 완료 ✅")
-else:
-    st.sidebar.error("모델 미로딩 ❌")
+if bundle: st.sidebar.success("모델 준비 완료 ✅")
+else:      st.sidebar.error("모델 미로딩 ❌")
+
+def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
+    """체크포인트가 기대하는 allies/enemies 개수에 맞춰 패딩/트렁케이트"""
+    if bundle is None: return 0.5
+    model = bundle["model"]
+    c2i   = bundle["champ_id2idx"]
+    enc   = bundle["enc_misc"]
+    na = bundle.get("allies", 4)
+    ne = bundle.get("enemies", 5)
+
+    device = torch.device("cpu")
+    unk_idx = len(c2i)  # 미등록 id → 마지막 인덱스 사용
+
+    def pad(ids, need):
+        ids = [int(x) for x in ids][:need]
+        while len(ids) < need: ids.append(0)
+        return ids
+
+    my = torch.tensor([[c2i.get(int(my_cid), unk_idx)]], dtype=torch.long).to(device)
+    ally = torch.tensor([[c2i.get(i, unk_idx) for i in pad(ally_ids, na)]], dtype=torch.long).to(device)
+    enem = torch.tensor([[c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)]], dtype=torch.long).to(device)
+    misc = enc_misc_row(enc, misc_row).to(device)
+
+    with torch.no_grad():
+        out = model(
+            my,
+            [ally[:, i] for i in range(ally.shape[1])],
+            [enem[:, i] for i in range(enem.shape[1])],
+            misc
+        )
+        prob = torch.sigmoid(out).cpu().item()
+    return float(prob)
 
 # ------------------------------------------------------------------
-# 개인 전적 CSV 불러오기
+# 내 전적 CSV 로드
 # ------------------------------------------------------------------
 st.sidebar.header("1) 내 전적 CSV")
 csv_mode = st.sidebar.radio("불러오기 방식", ["GitHub RAW URL", "파일 업로드"], horizontal=True)
@@ -227,15 +290,14 @@ else:
             st.sidebar.error(f"로드 실패: {e}")
 
 # ------------------------------------------------------------------
-# 개인 성향/최빈 룬 계산
+# 개인 성향/최빈 룬
 # ------------------------------------------------------------------
 def build_personal_stats(df: pd.DataFrame):
     if df is None or len(df)==0:
         return pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
     g = df.groupby("championId").agg(games=("win","size"), wins=("win","sum")).reset_index()
     g["wr"] = g["wins"]/g["games"]
-    # 개인 성향 점수: wr*1.0 + log(games) 보정
-    g["personal_score"] = g["wr"] + 0.1*np.log1p(g["games"])
+    g["personal_score"] = g["wr"] + 0.1*np.log1p(g["games"])  # 간단 보정
     return g
 
 def per_champ_misc_modes(df: pd.DataFrame):
@@ -243,20 +305,20 @@ def per_champ_misc_modes(df: pd.DataFrame):
         return {}
     cols = ["championId","spell_pair","primaryStyle","subStyle","keystone","patch"]
     for c in cols:
-        if c not in df.columns:
-            df[c] = "__UNK__"
+        if c not in df.columns: df[c] = "__UNK__"
     modes = {}
     for cid, sub in df.groupby("championId"):
         mode = {}
         for c in ["spell_pair","primaryStyle","subStyle","keystone","patch"]:
-            mode[c] = sub[c].mode(dropna=True).iloc[0] if not sub[c].mode(dropna=True).empty else "__UNK__"
+            s = sub[c].mode(dropna=True)
+            mode[c] = s.iloc[0] if not s.empty else "__UNK__"
         modes[int(cid)] = mode
     return modes
 
-# 기본 스펠/룬 추천(간단)
+# 간단 스펠/룬 추천
 ARAM_SPELLS = {
-    "Mark": "눈덩이","Exhaust": "탈진","Ignite": "점화","Ghost": "유체화",
-    "Heal": "회복","Barrier": "방어막","Cleanse": "정화","Clarity": "총명"
+    "Mark":"눈덩이", "Exhaust":"탈진", "Ignite":"점화", "Ghost":"유체화",
+    "Heal":"회복", "Barrier":"방어막", "Cleanse":"정화", "Clarity":"총명"
 }
 def suggest_spells_for_champ(cid: int, id2tags: dict, ally_ids: list[int], enemy_ids: list[int]):
     tags = set(id2tags.get(cid, []))
@@ -274,44 +336,13 @@ def suggest_runes_from_modes(cid: int, misc_modes: dict):
         "keystone": str(m.get("keystone","")),
     }
 
-# ------------------------------------------------------------------
-# 예측/점수 계산
-# ------------------------------------------------------------------
-def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
-    if bundle is None: return 0.5
-    model = bundle["model"]
-    c2i   = bundle["champ_id2idx"]
-    enc   = bundle["enc_misc"]
-    device = torch.device("cpu")
-
-    unk_idx = len(c2i)  # Embedding에서 마지막이 UNK
-    my = torch.tensor([ [c2i.get(int(my_cid), unk_idx)] ], dtype=torch.long).to(device)
-
-    def pad_ids(ids, need):
-        ids = [int(x) for x in ids][:need]
-        while len(ids)<need: ids.append(0)  # 0 → 임의(없는 id) → unk로 매핑됨
-        return ids
-
-    ally = tensorize_ids(pad_ids(ally_ids,4), c2i, unk_idx).to(device)
-    enem = tensorize_ids(pad_ids(enemy_ids,5), c2i, unk_idx).to(device)
-    misc = enc_misc_row(enc, misc_row).to(device)
-
-    with torch.no_grad():
-        logit = model(my, [ally[:,i] for i in range(4)], [enem[:,i] for i in range(5)], misc)
-        prob = torch.sigmoid(logit).cpu().item()
-    return float(prob)
-
 def comp_bonus_score(my_cid, ally_ids, id2tags):
-    # 매우 단순한 태그 시너지 보너스 (0~0.15)
     tags_me = set(id2tags.get(my_cid, []))
     allies = [set(id2tags.get(i, [])) for i in ally_ids]
     score = 0.0
-    # 탱/서포트 유무
     if "Tank" in tags_me and not any("Tank" in t for t in allies): score += 0.05
     if "Support" in tags_me and not any("Support" in t for t in allies): score += 0.05
-    # AP/AD 밸런스
-    ap_like = {"Mage","Support"}
-    ad_like = {"Marksman","Fighter","Assassin"}
+    ap_like = {"Mage","Support"}; ad_like = {"Marksman","Fighter","Assassin"}
     ally_ap = sum(any(tt in ap_like for tt in t) for t in allies)
     ally_ad = sum(any(tt in ad_like for tt in t) for t in allies)
     if "Mage" in tags_me and ally_ap<=1: score += 0.03
@@ -319,34 +350,32 @@ def comp_bonus_score(my_cid, ally_ids, id2tags):
     return min(score, 0.15)
 
 # ------------------------------------------------------------------
-# [픽창 입력] – 드롭다운 수동 입력 UI
+# [수동 입력] 픽창 UI
 # ------------------------------------------------------------------
 st.markdown("## 3) 픽창 입력")
-colL, colR = st.columns(2)
-with colL:
+c1, c2 = st.columns(2)
+with c1:
     ally_names = st.multiselect("아군 챔피언", champ_df["name"].tolist(), max_selections=4)
-with colR:
+with c2:
     enemy_names = st.multiselect("상대 챔피언 (선택)", champ_df["name"].tolist(), max_selections=5)
 
-cand_names = st.multiselect("후보 챔피언 (선택)", champ_df["name"].tolist(), help="여기 넣은 후보들만 점수화합니다.")
+cand_names = st.multiselect("후보 챔피언 (선택)", champ_df["name"].tolist(), help="여기에 넣은 후보들만 점수화합니다.")
 alpha = st.slider("α 모델 가중치", 0.0, 1.0, 0.60, 0.01)
 beta  = st.slider("β 개인 성향 가중치", 0.0, 1.0, 0.35, 0.01)
 gamma = st.slider("γ 조합 보너스 가중치", 0.0, 0.5, 0.05, 0.01)
 min_games = st.number_input("개인 성향 최소 표본", 0, 50, 5, step=1)
 
-# 세션에 저장(스크린샷 탭에서도 사용)
 st.session_state["alpha"] = alpha
 st.session_state["beta"]  = beta
 st.session_state["gamma"] = gamma
 
 if st.button("🚀 추천 실행"):
     if len(ally_names) != 4 or len(cand_names)==0:
-        st.warning("아군 4명과 후보를 선택해 주세요.")
+        st.warning("아군 4명과 후보를 선택해주세요.")
     else:
         ally_ids = [name2id[n] for n in ally_names]
         enemy_ids = [name2id[n] for n in enemy_names] if enemy_names else []
 
-        # 개인 통계/룬 모드
         per = build_personal_stats(df_pre) if df_pre is not None else pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
         per_map = per.set_index("championId").to_dict(orient="index") if len(per)>0 else {}
         misc_modes = per_champ_misc_modes(df_pre) if df_pre is not None else {}
@@ -355,15 +384,15 @@ if st.button("🚀 추천 실행"):
         for cname in cand_names:
             cid = name2id[cname]
             meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
-            ps = meta["personal_score"] - (0.3 if meta["games"]<min_games else 0.0)
+            ps   = meta["personal_score"] - (0.3 if meta["games"]<min_games else 0.0)
 
             mode = misc_modes.get(cid, {})
             misc_row = {
-                "spell_pair": str(mode.get("spell_pair", "__UNK__")),
-                "primaryStyle": str(mode.get("primaryStyle", "__UNK__")),
-                "subStyle": str(mode.get("subStyle", "__UNK__")),
-                "keystone": str(mode.get("keystone", "__UNK__")),
-                "patch": str(mode.get("patch", "__UNK__")),
+                "spell_pair": str(mode.get("spell_pair","__UNK__")),
+                "primaryStyle": str(mode.get("primaryStyle","__UNK__")),
+                "subStyle": str(mode.get("subStyle","__UNK__")),
+                "keystone": str(mode.get("keystone","__UNK__")),
+                "patch": str(mode.get("patch","__UNK__")),
             }
             prob  = predict_prob_comp(bundle, cid, ally_ids, enemy_ids, misc_row)
             bonus = comp_bonus_score(cid, ally_ids, id2tags)
@@ -378,7 +407,7 @@ if st.button("🚀 추천 실행"):
                 "예측승률α(%)": round(prob*100,2),
                 "조합보너스γ(%)": round(bonus*100,2),
                 "개인_게임수": meta.get("games",0),
-                "개인_승률(%)": round(meta["wr"]*100,2) if pd.notna(meta.get("wr")) else None,
+                "개인_승률(%)": round(meta.get("wr",0)*100,2) if pd.notna(meta.get("wr")) else None,
                 "추천_스펠": " + ".join(spells),
                 "추천_룬": f"주{rune['primaryStyle']} · 부{rune['subStyle']} · 핵심{rune['keystone']}",
                 "점수": score
@@ -403,7 +432,6 @@ if st.button("🚀 추천 실행"):
 st.markdown("---")
 st.header("🖼️ 픽창 스크린샷으로 자동 추천 (β)")
 
-import io
 from PIL import Image
 
 def init_vertex():
@@ -420,8 +448,7 @@ def init_vertex():
         st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
         return None
     key_path = "/tmp/gcp_key.json"
-    with open(key_path, "w", encoding="utf-8") as f:
-        f.write(sa)
+    with open(key_path, "w", encoding="utf-8") as f: f.write(sa)
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
 
     import vertexai
@@ -429,17 +456,16 @@ def init_vertex():
     from vertexai.generative_models import GenerativeModel
     return GenerativeModel("gemini-1.5-flash")
 
-def _names_to_ids(names):
+def _names_to_ids(names):  # Korean name → champId
     return [int(name2id[n]) for n in names if n in name2id]
 
 up_img = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"])
 if up_img and st.button("🔍 스샷 인식 & 추천"):
     img = Image.open(up_img).convert("RGB")
-    st.image(img, caption="입력 이미지", use_column_width=True)
+    st.image(img, caption="입력 이미지", use_container_width=True)
 
     model = init_vertex()
-    if model is None:
-        st.stop()
+    if model is None: st.stop()
 
     from vertexai.generative_models import Part
     sys_prompt = (
@@ -477,7 +503,6 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
         st.info("아군 4명 또는 후보가 충분히 인식되지 않았습니다. 이미지 해상도/밝기를 높여 다시 시도해 주세요.")
         st.stop()
 
-    # 개인 통계/룬 모드
     per = build_personal_stats(df_pre) if df_pre is not None else pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
     per_map = per.set_index("championId").to_dict(orient="index") if len(per)>0 else {}
     misc_modes = per_champ_misc_modes(df_pre) if df_pre is not None else {}
@@ -490,15 +515,15 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     for cid in cand_ids:
         cname = id2name.get(cid, str(cid))
         meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
-        ps = meta["personal_score"] - (0.3 if meta["games"]<5 else 0.0)
+        ps   = meta["personal_score"] - (0.3 if meta["games"]<5 else 0.0)
 
         mode = misc_modes.get(cid, {})
         misc_row = {
-            "spell_pair": str(mode.get("spell_pair", "__UNK__")),
-            "primaryStyle": str(mode.get("primaryStyle", "__UNK__")),
-            "subStyle": str(mode.get("subStyle", "__UNK__")),
-            "keystone": str(mode.get("keystone", "__UNK__")),
-            "patch": str(mode.get("patch", "__UNK__")),
+            "spell_pair": str(mode.get("spell_pair","__UNK__")),
+            "primaryStyle": str(mode.get("primaryStyle","__UNK__")),
+            "subStyle": str(mode.get("subStyle","__UNK__")),
+            "keystone": str(mode.get("keystone","__UNK__")),
+            "patch": str(mode.get("patch","__UNK__")),
         }
         prob  = predict_prob_comp(bundle, cid, ally_ids, [], misc_row)
         bonus = comp_bonus_score(cid, ally_ids, id2tags)
