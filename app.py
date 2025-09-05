@@ -192,27 +192,47 @@ def load_model(local_path: str):
 
 @st.cache_resource(show_spinner=True)
 def get_bundle():
-    # 1) 로컬 우선
+    # 0) 로컬 파일이 HTML/깨진 파일인지 사전 검증 → 있으면 삭제
+    if os.path.exists(LOCAL_MODEL_PATH):
+        try:
+            with open(LOCAL_MODEL_PATH, "rb") as f:
+                head = f.read(32)
+            if head.strip().startswith(b"<"):
+                # 예전 실패로 HTML이 저장되어 있던 케이스 → 삭제
+                os.remove(LOCAL_MODEL_PATH)
+        except Exception:
+            pass
+
+    # 1) 로컬 우선 로드 시도
     if os.path.exists(LOCAL_MODEL_PATH):
         try:
             b = load_model(LOCAL_MODEL_PATH)
-            if b: return b
+            if b:
+                return b
         except Exception as e:
+            # 깨진 파일이면 지우고 URL 재시도
+            try:
+                os.remove(LOCAL_MODEL_PATH)
+            except Exception:
+                pass
             st.warning(f"로컬 모델 로드 실패, URL 재시도: {e}")
 
-    # 2) Secrets/ENV의 MODEL_URL
+    # 2) Secrets/ENV에서 MODEL_URL 읽어 다운로드
     url = os.environ.get("MODEL_URL", "")
     if not url and "MODEL_URL" in st.secrets:
         url = st.secrets["MODEL_URL"].strip()
+
     if url:
-        dl_path = LOCAL_MODEL_PATH if not os.path.exists(LOCAL_MODEL_PATH) else "model/pregame_mlp_comp_dl.pt"
-        path = ensure_model_file(dl_path, url)
+        dl_path = LOCAL_MODEL_PATH   # 항상 같은 경로로 저장
+        path = ensure_model_file(dl_path, url)  # 이 함수는 그대로 사용해도 됨
         if path:
             try:
                 b = load_model(path)
-                if b: return b
+                if b:
+                    return b
             except Exception as e:
                 st.error(f"다운로드 모델 로드 실패: {e}")
+
     st.error("모델 준비 실패 (로컬 파일 없음 & MODEL_URL 미설정)")
     return None
 
