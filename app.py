@@ -2,6 +2,11 @@ import os, io, json, time, requests, numpy as np, pandas as pd, streamlit as st,
 import torch.nn as nn
 from sklearn.preprocessing import OrdinalEncoder  # enc_misc 로드용
 
+# 기존 import 들 아래에 추가
+from torch.serialization import add_safe_globals
+from sklearn.preprocessing import OrdinalEncoder  # 이미 있을 수도 있음
+add_safe_globals([OrdinalEncoder])  # sklearn 객체 로드 허용
+
 LANG = "ko_KR"
 LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 우선 여기서 찾고, 없으면 MODEL_URL에서 다운로드
 CSV_DEFAULT_RAW_URL = ""  # 선택: 내 CSV RAW URL을 여기에 기본값으로 지정 가능
