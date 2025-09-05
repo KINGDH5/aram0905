@@ -4,3 +4,5 @@ numpy
 requests
 torch
 scikit-learn
+google-cloud-aiplatform
+pillow
