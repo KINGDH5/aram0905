@@ -223,7 +223,7 @@ def enc_misc_row(enc: OrdinalEncoder, row: dict):
         row.get("subStyle", "__UNK__"),
         row.get("keystone", "__UNK__"),
         row.get("patch", "__UNK__"),
-    ]]]
+    ]]
     arr = enc.transform(vals).astype(int)  # -1 포함 가능
     for j in range(arr.shape[1]):
         if arr[0, j] < 0:
