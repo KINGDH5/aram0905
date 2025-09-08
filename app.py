@@ -1,5 +1,6 @@
 # app.py
-# ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP) + 스크린샷 인식(β: 비율크롭+아이콘매칭)
+# ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP)
+# 팀(아군 4명): 스크린샷 자동 인식(Gemini)  / 후보 5칸: 비율 크롭 + 아이콘 템플릿 매칭
 
 import os, io, re, json, requests, numpy as np, pandas as pd, streamlit as st, torch
 import torch.nn as nn
@@ -109,11 +110,8 @@ class CompMLP_Exact(nn.Module):
         enemies = [self.emb_champ(e) for e in enem_lists[: self.n_enemies]]
         for _ in range(max(0, self.n_enemies - len(enemies))):
             enemies.append(self.emb_champ(torch.zeros_like(my_idx)))
-        sp  = self.emb_sp(misc_idx[:, 0])
-        pri = self.emb_pri(misc_idx[:, 1])
-        sub = self.emb_sub(misc_idx[:, 2])
-        key = self.emb_key(misc_idx[:, 3])
-        pat = self.emb_pat(misc_idx[:, 4])
+        sp  = self.emb_sp(misc_idx[:, 0]); pri = self.emb_pri(misc_idx[:, 1])
+        sub = self.emb_sub(misc_idx[:, 2]); key = self.emb_key(misc_idx[:, 3]); pat = self.emb_pat(misc_idx[:, 4])
         misc = torch.cat([sp, pri, sub, key, pat], dim=-1)
         x = torch.cat([me, *allies, *enemies, misc], dim=-1)
         try:
@@ -366,88 +364,26 @@ def comp_bonus_score(my_cid, ally_ids, id2tags):
     return min(score, 0.15)
 
 # ==================================================================
-# [수동 입력] 픽창 UI
+# [수동 입력] 픽창 UI (폴백 용)
 # ==================================================================
-st.markdown("## 3) 픽창 입력")
+st.markdown("## 3) 픽창 입력(폴백)")
 c1, c2 = st.columns(2)
 with c1:
-    ally_names = st.multiselect("아군 챔피언", champ_df["name"].tolist(), max_selections=4)
+    ally_names_manual = st.multiselect("아군 챔피언(폴백용)", champ_df["name"].tolist(), max_selections=4)
 with c2:
-    enemy_names = st.multiselect("상대 챔피언 (선택)", champ_df["name"].tolist(), max_selections=5)
+    enemy_names_manual = st.multiselect("상대 챔피언 (선택)", champ_df["name"].tolist(), max_selections=5)
 
-st.session_state["ally_names"] = ally_names
-st.session_state["enemy_names"] = enemy_names
-
-cand_names = st.multiselect("후보 챔피언 (선택)", champ_df["name"].tolist(), help="여기에 넣은 후보들만 점수화합니다.")
-alpha = st.slider("α 모델 가중치", 0.0, 1.0, 0.60, 0.01)
-beta  = st.slider("β 개인 성향 가중치", 0.0, 1.0, 0.35, 0.01)
-gamma = st.slider("γ 조합 보너스 가중치", 0.0, 0.5, 0.05, 0.01)
-min_games = st.number_input("개인 성향 최소 표본", 0, 50, 5, step=1)
-
-st.session_state["alpha"] = alpha
-st.session_state["beta"]  = beta
-st.session_state["gamma"] = gamma
-st.session_state["min_games"] = min_games
-
-if st.button("🚀 추천 실행"):
-    if len(ally_names) != 4 or len(cand_names)==0:
-        st.warning("아군 4명과 후보를 선택해주세요.")
-    else:
-        ally_ids = [name2id[n] for n in ally_names]
-        enemy_ids = [name2id[n] for n in enemy_names] if enemy_names else []
-        per = build_personal_stats(df_pre) if df_pre is not None else pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
-        per_map = per.set_index("championId").to_dict(orient="index") if len(per)>0 else {}
-        misc_modes = per_champ_misc_modes(df_pre) if df_pre is not None else {}
-        rows = []
-        for cname in cand_names:
-            cid = name2id[cname]
-            meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
-            ps = meta["personal_score"] - (0.3 if meta["games"]<min_games else 0.0)
-            mode = misc_modes.get(cid, {})
-            misc_row = {
-                "spell_pair": str(mode.get("spell_pair","__UNK__")),
-                "primaryStyle": str(mode.get("primaryStyle","__UNK__")),
-                "subStyle": str(mode.get("subStyle","__UNK__")),
-                "keystone": str(mode.get("keystone","__UNK__")),
-                "patch": str(mode.get("patch","__UNK__")),
-            }
-            prob  = predict_prob_comp(bundle, cid, ally_ids, enemy_ids, misc_row)
-            bonus = comp_bonus_score(cid, ally_ids, id2tags)
-            score = alpha*prob + beta*ps + gamma*bonus
-            rune = suggest_runes_from_modes(cid, misc_modes)
-            spells = personal_spell_from_df(df_pre, cid, min_games=min_games) or \
-                     suggest_spells_for_champ(cid, id2tags, ally_ids, enemy_ids)
-            rows.append({
-                "icon": id2icon.get(cid,""),
-                "챔피언": cname,
-                "예측승률α(%)": round(prob*100,2),
-                "조합보너스γ(%)": round(bonus*100,2),
-                "개인_게임수": meta.get("games",0),
-                "개인_승률(%)": round(meta.get("wr",0)*100,2) if pd.notna(meta.get("wr")) else None,
-                "추천_스펠": " + ".join(spells),
-                "추천_룬": f"주{rune['primaryStyle']} · 부{rune['subStyle']} · 핵심{rune['keystone']}",
-                "점수": score
-            })
-        out = pd.DataFrame(rows).sort_values("점수", ascending=False).reset_index(drop=True)
-        st.subheader("추천 결과")
-        top3 = out.head(3); cols = st.columns(len(top3))
-        for col, (_, r) in zip(cols, top3.iterrows()):
-            with col:
-                if r["icon"]: st.image(r["icon"], width=64)
-                st.markdown(f"**{r['챔피언']}**")
-                st.write(f"예측 {r['예측승률α(%)']}% | 보너스 {r['조합보너스γ(%)']}%")
-                st.write(f"스펠: {r['추천_스펠']}"); st.write(r["추천_룬"])
-        st.subheader("전체 표")
-        table = out.drop(columns=["점수"]).copy()
-        st.dataframe(table, column_config={"icon": st.column_config.ImageColumn(" ", help="챔피언 아이콘", width="small")}, use_container_width=True)
+# 세션 저장
+st.session_state["ally_names_manual"] = ally_names_manual
+st.session_state["enemy_names_manual"] = enemy_names_manual
 
 # ==================================================================
-# 🧩 비율 좌표 크롭 + 아이콘 템플릿 매칭
+# 🧩 후보 바 비율 크롭 + 아이콘 템플릿 매칭  +  팀(아군) 자동 인식(Gemini)
 # ==================================================================
 st.markdown("---")
-st.header("🖼️ 픽창 스크린샷으로 자동 추천 (β · 비율크롭)")
+st.header("🖼️ 픽창 스크린샷으로 자동 추천 (팀 자동 + 후보 비율크롭)")
 
-# ── 이 스크린샷에 맞춘 기본값 (필요시 슬라이더로 미세조정)
+# ── 이 스크린샷(예시)에 맞춘 기본값 (원하면 미세조정)
 with st.sidebar.expander("후보 바 비율(상단 5칸) 튜닝", expanded=True):
     bar_x0_ratio = st.slider("bar_x0_ratio", 0.00, 1.00, 0.335, 0.001)
     bar_x1_ratio = st.slider("bar_x1_ratio", 0.00, 1.00, 0.735, 0.001)
@@ -467,16 +403,15 @@ class CandidateBarConfig:
         self.w_scale=w_scale; self.h_scale=h_scale
 
 def auto_trim_letterbox(img: Image.Image, thresh: int = 8) -> Image.Image:
-    arr = np.asarray(img.convert("L"))
-    H, W = arr.shape
+    arr = np.asarray(img.convert("L")); H, W = arr.shape
     top=0
-    while top < H and arr[top].mean() < thresh: top += 1
+    while top<H and arr[top].mean()<thresh: top+=1
     bot=H-1
-    while bot>top and arr[bot].mean() < thresh: bot -= 1
+    while bot>top and arr[bot].mean()<thresh: bot-=1
     left=0
-    while left<W and arr[:,left].mean() < thresh: left += 1
+    while left<W and arr[:,left].mean()<thresh: left+=1
     right=W-1
-    while right>left and arr[:,right].mean() < thresh: right -= 1
+    while right>left and arr[:,right].mean()<thresh: right-=1
     if right-left < W*0.5 or bot-top < H*0.5: return img
     return img.crop((left, top, right+1, bot+1))
 
@@ -545,36 +480,114 @@ def predict_champion_from_icon(crop_img: Image.Image, bank: Dict[str, np.ndarray
     conf = max(0.0, 1.0 - min(best_dist, 0.1)/0.1)  # 0~0.1 → 1.0~0.0
     return best_name, conf
 
-up_img2 = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"], key="ratio_uploader")
-if up_img2 and st.button("🔍 스샷 인식 & 추천 (비율크롭)"):
-    img = Image.open(up_img2).convert("RGB")
+# ── Gemini 초기화 & 팀(아군)만 JSON으로 추출
+def init_vertex():
+    try:
+        import vertexai
+        from vertexai.generative_models import GenerativeModel
+    except Exception as e:
+        st.info("Vertex AI 라이브러리가 없습니다. (pip 설치 또는 Secrets 설정 필요)")
+        return None
+    proj = st.secrets.get("GCP_PROJECT", "")
+    loc  = st.secrets.get("GCP_LOCATION", "us-central1")
+    sa_raw = st.secrets.get("GCP_SA_JSON", "")
+    if not (proj and sa_raw):
+        st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
+        return None
+    try:
+        sa_obj = json.loads(sa_raw)
+    except Exception as e:
+        st.error(f"GCP_SA_JSON 파싱 실패: {e}")
+        return None
+    key_path = "/tmp/gcp_key.json"
+    with open(key_path, "w", encoding="utf-8") as f:
+        json.dump(sa_obj, f)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+    import vertexai
+    vertexai.init(project=proj, location=loc)
+    from vertexai.generative_models import GenerativeModel
+    prefer = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash-002")
+    model = GenerativeModel(prefer)
+    return model
+
+def detect_allies_from_gemini(img: Image.Image) -> List[str] | None:
+    model = init_vertex()
+    if model is None: return None
+    from vertexai.generative_models import Part
+    sys_prompt = (
+        "You are extracting ONLY ally champions (left 4 slots) from a Korean ARAM pick-phase screenshot. "
+        "Return STRICT JSON: {\"ally_champions\": [\"...\",\"...\",\"...\",\"...\"]}. "
+        "Names must exactly match Korean champion names used in the League client. "
+        "If uncertain, leave that entry out. No extra text."
+    )
+    buf = io.BytesIO(); img.save(buf, format="PNG")
+    resp = model.generate_content(
+        [sys_prompt, Part.from_data(mime_type="image/png", data=buf.getvalue())],
+        generation_config={"temperature": 0.1, "max_output_tokens": 256},
+    )
+    raw = getattr(resp, "text", "") or ""
+    if not raw and getattr(resp, "candidates", None):
+        parts = []
+        for c in resp.candidates:
+            try:
+                for p in getattr(c, "content", {}).parts or []:
+                    if getattr(p, "text", None):
+                        parts.append(p.text)
+            except Exception:
+                pass
+        raw = "\n".join(parts)
+    m = re.search(r"\{[\s\S]*\}", (raw or "").strip())
+    if not m: return None
+    try:
+        data = json.loads(m.group(0))
+        allies = data.get("ally_champions", [])
+        return [str(x) for x in allies if str(x) in name2id]
+    except Exception:
+        return None
+
+# ===== 업로더 =====
+up_img = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"])
+if up_img and st.button("🔍 스샷 인식 & 추천 (팀 자동 + 후보 비율크롭)"):
+    img = Image.open(up_img).convert("RGB")
+
+    # 1) 후보 5칸 인식 (비율 크롭 + 아이콘 매칭)
     cfg = CandidateBarConfig(bar_x0_ratio, bar_x1_ratio, bar_y0_ratio, bar_y1_ratio,
                              col_gap_ratio, x_shift, y_shift, w_scale, h_scale)
     base, slots, rects = crop_candidate_slots(img, cfg)
+    st.image(draw_overlay(base, rects), caption="후보칸 오버레이 프리뷰", use_container_width=True)
 
-    st.image(draw_overlay(base, rects), caption="크롭 오버레이 프리뷰", use_container_width=True)
     cols = st.columns(5)
     for i, cimg in enumerate(slots):
         with cols[i]:
             st.image(cimg, caption=f"후보 {i+1}", use_container_width=True)
 
     bank = build_icon_bank(size=icon_match_size)
-    cand_names_detected = []
+    cand_names = []
     for cimg in slots:
         name, conf = predict_champion_from_icon(cimg, bank, size=icon_match_size)
         if name and name in name2id and conf >= 0.35:
-            cand_names_detected.append(name)
-    cand_names_detected = list(dict.fromkeys(cand_names_detected))[:5]
-    st.write("인식된 후보:", cand_names_detected if cand_names_detected else "없음")
-
-    ally_names_ss = st.session_state.get("ally_names", [])
-    enemy_names_ss = st.session_state.get("enemy_names", [])
-    if len(ally_names_ss) != 4 or not cand_names_detected:
-        st.warning("아군 4명 선택(상단 '픽창 입력') 및 후보 인식이 필요합니다.")
+            cand_names.append(name)
+    cand_names = list(dict.fromkeys(cand_names))[:5]
+    if not cand_names:
+        st.warning("후보 챔피언 인식 실패(비율 슬라이더/밝기 조정).")
         st.stop()
 
-    ally_ids = [name2id[n] for n in ally_names_ss]
-    enemy_ids = [name2id[n] for n in enemy_names_ss] if enemy_names_ss else []
+    # 2) 아군 4명 자동 인식 (Gemini) → 실패 시 수동값 폴백
+    ally_names_auto = detect_allies_from_gemini(img)
+    if ally_names_auto and len(ally_names_auto) >= 4:
+        ally_names = ally_names_auto[:4]
+        st.success(f"아군 자동 인식: {ally_names}")
+    else:
+        ally_names = st.session_state.get("ally_names_manual", [])
+        if len(ally_names) != 4:
+            st.warning("아군 4명 자동 인식 실패. 사이드바에서 수동으로 4명을 선택하세요.")
+            st.stop()
+
+    enemy_names = st.session_state.get("enemy_names_manual", [])
+
+    # 3) 추천 계산
+    ally_ids  = [name2id[n] for n in ally_names]
+    enemy_ids = [name2id[n] for n in enemy_names] if enemy_names else []
     per = build_personal_stats(df_pre) if df_pre is not None else pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
     per_map = per.set_index("championId").to_dict(orient="index") if len(per)>0 else {}
     misc_modes = per_champ_misc_modes(df_pre) if df_pre is not None else {}
@@ -584,7 +597,7 @@ if up_img2 and st.button("🔍 스샷 인식 & 추천 (비율크롭)"):
     min_games_used = st.session_state.get("min_games", 5)
 
     rows = []
-    for cname in cand_names_detected:
+    for cname in cand_names:
         cid = name2id[cname]
         meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
         ps   = meta["personal_score"] - (0.3 if meta["games"]<min_games_used else 0.0)
