@@ -28,7 +28,7 @@ LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포에 없으면 MODEL_URL�
 os.makedirs("model", exist_ok=True)
 
 # ------------------------------------------------------------------
-# Data Dragon 챔피언 정적 정보
+# Data Dragon 정적 정보 (챔피언/룬)
 # ------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def ddragon_latest_version():
@@ -58,7 +58,29 @@ def load_champion_static(lang=LANG):
     name2id = {r.name: r.championId for r in df.itertuples()}
     return df, id2name, id2icon, id2tags, name2id
 
+@st.cache_data(show_spinner=True)
+def load_runes_static(lang=LANG):
+    """
+    runesReforged.json을 불러 ID→이름 매핑을 만든다.
+    - style_id2name: 8000/8100/... → "정밀"/"지배"/...
+    - keystone_id2name: 8128/8010/... → "감전"/"정복자"/...
+    """
+    ver = ddragon_latest_version()
+    url = f"https://ddragon.leagueoflegends.com/cdn/{ver}/data/{lang}/runesReforged.json"
+    data = requests.get(url, timeout=20).json()
+
+    style_id2name = {}
+    keystone_id2name = {}
+    for style in data:
+        style_id2name[style["id"]] = style["name"]
+        if style.get("slots"):
+            # 슬롯0 = 키스톤
+            for r in style["slots"][0].get("runes", []):
+                keystone_id2name[r["id"]] = r["name"]
+    return style_id2name, keystone_id2name
+
 champ_df, id2name, id2icon, id2tags, name2id = load_champion_static()
+style_id2name, keystone_id2name = load_runes_static()
 
 # ------------------------------------------------------------------
 # 체크포인트 모양을 그대로 복원하는 모델 로더 (크기 mismatch 방지)
@@ -128,10 +150,9 @@ class CompMLP_Exact(nn.Module):
 
         # ===== 안전 가드: in_features와 정확히 맞추기 =====
         try:
-            first_linear = self.mlp[0]            # nn.Linear
+            first_linear = self.mlp[0]
             expect = int(first_linear.in_features)
         except Exception:
-            # 드롭아웃 유무에 따른 인덱스 차이를 대비해 첫 Linear를 탐색
             expect = None
             for mod in self.mlp:
                 if isinstance(mod, torch.nn.Linear):
@@ -141,7 +162,6 @@ class CompMLP_Exact(nn.Module):
         if expect is not None:
             cur = int(x.size(-1))
             if cur != expect:
-                # 디버그: 한 번만 경고
                 if not hasattr(self, "_dim_warned"):
                     import streamlit as st
                     st.warning(
@@ -149,16 +169,12 @@ class CompMLP_Exact(nn.Module):
                         f"(allies={self.n_allies}, enemies={self.n_enemies})"
                     )
                     self._dim_warned = True
-
                 if cur < expect:
-                    # 부족 → 0 패딩
                     pad = torch.zeros(x.size(0), expect - cur, device=x.device, dtype=x.dtype)
                     x = torch.cat([x, pad], dim=-1)
                 else:
-                    # 넘침 → 잘라내기
                     x = x[..., :expect]
 
-        # ----- MLP 통과 -----
         return self.mlp(x).squeeze(-1)
 
 def _infer_model_from_state(sd):
@@ -178,19 +194,17 @@ def _infer_model_from_state(sd):
 
     misc_sum = d_sp + d_pri + d_sub + d_key + d_pat
 
-    # ---- allies/enemies 자동 탐색 (정확히 in_dim 일치) ----
+    # allies/enemies 자동 탐색 (정확히 in_dim 일치)
     best = None
-    for allies in range(0, 6):        # 0~5
-        for enemies in range(0, 10):  # 0~9
+    for allies in range(0, 6):
+        for enemies in range(0, 10):
             expect = d_champ * (1 + allies + enemies) + misc_sum
             if expect == in_dim:
-                # allies=4 선호, 같으면 enemies 큰 쪽
-                score = -abs(allies - 4) * 10 + enemies
+                score = -abs(allies - 4) * 10 + enemies  # allies=4 선호
                 cand = (score, allies, enemies)
                 if best is None or cand > best:
                     best = cand
     if best is None:
-        # 폴백: 총 슬롯 역산
         total_slots = (in_dim - misc_sum) // d_champ
         allies = 4
         enemies = max(total_slots - 1 - allies, 0)
@@ -400,12 +414,12 @@ else:
     if up:
         try:
             df_pre = pd.read_csv(up)
-            st.sidebar.success(f"CSV 로드: {len(df_pre)}행")
+            st.sidebar.success(f"CSV 로드: {len[df_pre]}행")
         except Exception as e:
             st.sidebar.error(f"로드 실패: {e}")
 
 # ------------------------------------------------------------------
-# 개인 성향/최빈 룬
+# 개인 성향/최빈 룬/스펠
 # ------------------------------------------------------------------
 def build_personal_stats(df: pd.DataFrame):
     if df is None or len(df)==0:
@@ -430,7 +444,7 @@ def per_champ_misc_modes(df: pd.DataFrame):
         modes[int(cid)] = mode
     return modes
 
-# 간단 스펠/룬 추천
+# 간단 스펠/룬 추천 휴리스틱
 ARAM_SPELLS = {
     "Mark":"눈덩이", "Exhaust":"탈진", "Ignite":"점화", "Ghost":"유체화",
     "Heal":"회복", "Barrier":"방어막", "Cleanse":"정화", "Clarity":"총명"
@@ -445,11 +459,38 @@ def suggest_spells_for_champ(cid: int, id2tags: dict, ally_ids: list[int], enemy
 
 def suggest_runes_from_modes(cid: int, misc_modes: dict):
     m = misc_modes.get(cid, {})
-    return {
-        "primaryStyle": str(m.get("primaryStyle","")),
-        "subStyle": str(m.get("subStyle","")),
-        "keystone": str(m.get("keystone","")),
-    }
+    ps = m.get("primaryStyle", "")
+    ss = m.get("subStyle", "")
+    ks = m.get("keystone", "")
+
+    def to_int(x):
+        try: return int(x)
+        except Exception: return None
+
+    psn = style_id2name.get(to_int(ps), str(ps))          # 스타일 이름
+    ssn = style_id2name.get(to_int(ss), str(ss))          # 보조 스타일 이름
+    ksn = keystone_id2name.get(to_int(ks), str(ks))       # 키스톤 이름
+    return {"primaryStyle": psn, "subStyle": ssn, "keystone": ksn}
+
+def personal_spell_from_df(df: pd.DataFrame, cid: int, min_games: int = 3):
+    """
+    내 CSV에서 해당 챔피언의 최빈 스펠 조합을 가져와 추천.
+    - 표본 수가 min_games 미만이면 None → 휴리스틱 폴백
+    - CSV 'spell_pair'가 "눈덩이+점화" 형식이라고 가정
+    """
+    if df is None or len(df) == 0 or "spell_pair" not in df.columns:
+        return None
+    sub = df[(df["championId"] == cid) & (df["spell_pair"].notna())]
+    if sub.empty:
+        return None
+    cnt = sub.groupby("spell_pair").size().sort_values(ascending=False)
+    top_pair = cnt.index[0]
+    if cnt.iloc[0] < min_games:
+        return None
+    parts = [p.strip() for p in str(top_pair).split("+") if p.strip()]
+    if len(parts) == 2:
+        return parts
+    return None
 
 def comp_bonus_score(my_cid, ally_ids, id2tags):
     tags_me = set(id2tags.get(my_cid, []))
@@ -483,6 +524,7 @@ min_games = st.number_input("개인 성향 최소 표본", 0, 50, 5, step=1)
 st.session_state["alpha"] = alpha
 st.session_state["beta"]  = beta
 st.session_state["gamma"] = gamma
+st.session_state["min_games"] = min_games
 
 if st.button("🚀 추천 실행"):
     if len(ally_names) != 4 or len(cand_names)==0:
@@ -514,7 +556,8 @@ if st.button("🚀 추천 실행"):
             score = alpha*prob + beta*ps + gamma*bonus
 
             rune = suggest_runes_from_modes(cid, misc_modes)
-            spells = suggest_spells_for_champ(cid, id2tags, ally_ids, enemy_ids)
+            spells = personal_spell_from_df(df_pre, cid, min_games=min_games) \
+                     or suggest_spells_for_champ(cid, id2tags, ally_ids, enemy_ids)
 
             rows.append({
                 "icon": id2icon.get(cid,""),
@@ -529,6 +572,7 @@ if st.button("🚀 추천 실행"):
             })
 
         out = pd.DataFrame(rows).sort_values("점수", ascending=False).reset_index(drop=True)
+
         st.subheader("추천 결과")
         top3 = out.head(3)
         cols = st.columns(len(top3))
@@ -539,7 +583,17 @@ if st.button("🚀 추천 실행"):
                 st.write(f"예측 {r['예측승률α(%)']}% | 보너스 {r['조합보너스γ(%)']}%")
                 st.write(f"스펠: {r['추천_스펠']}")
                 st.write(r["추천_룬"])
-        st.dataframe(out.drop(columns=["점수"]), use_container_width=True)
+
+        # === 전체 표 (아이콘 실제 이미지 렌더) ===
+        st.subheader("전체 표")
+        table = out.drop(columns=["점수"]).copy()
+        st.dataframe(
+            table,
+            column_config={
+                "icon": st.column_config.ImageColumn(" ", help="챔피언 아이콘", width="small")
+            },
+            use_container_width=True,
+        )
 
 # ------------------------------------------------------------------
 # 🖼️ 스크린샷 업로드 → 자동 인식 (Vertex AI)
@@ -562,7 +616,6 @@ def init_vertex():
         st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
         return None
 
-    # 시크릿 문자열은 이미 \\n 이스케이프가 들어간 유효한 JSON이어야 함
     try:
         sa_obj = json.loads(sa_raw)
     except Exception as e:
@@ -583,7 +636,6 @@ def init_vertex():
                   "gemini-1.5-flash-002", "gemini-1.0-pro-vision-001"]
 
     last_err = None
-    # ✅ 모델 헬스체크: 텍스트만 한 토큰 요청
     for m in candidates:
         try:
             model = GenerativeModel(m)
@@ -641,7 +693,6 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
         parts = []
         for c in resp.candidates:
             try:
-                # content.parts[*].text 에 있을 수 있음
                 for p in getattr(c, "content", {}).parts or []:
                     if getattr(p, "text", None):
                         parts.append(p.text)
@@ -654,7 +705,7 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
         st.error("모델 응답이 비었습니다. (인증/권한/리전/모델명을 다시 확인)")
         st.stop()
 
-    # ---- JSON만 추출 (코드블럭/앞뒤 텍스트 섞여도 OK) ----
+    # ---- JSON만 추출 ----
     m = re.search(r"\{[\s\S]*\}", raw)
     if not m:
         st.error("응답에서 JSON 블록을 찾지 못했습니다. 프롬프트를 다시 보내 보세요.")
@@ -686,10 +737,11 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     alpha = st.session_state.get("alpha", 0.60)
     beta  = st.session_state.get("beta", 0.35)
     gamma = st.session_state.get("gamma", 0.05)
+    min_games_used = st.session_state.get("min_games", 5)
 
     rows = []
     for cid in cand_ids:
-        cname = id2name.get(cid, str(cid))
+        cname = id2name.get(cid, str(cid])
         meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
         ps   = meta["personal_score"] - (0.3 if meta["games"]<5 else 0.0)
 
@@ -706,7 +758,8 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
         score = alpha*prob + beta*ps + gamma*bonus
 
         rune = suggest_runes_from_modes(cid, misc_modes)
-        spells = suggest_spells_for_champ(cid, id2tags, ally_ids, [])
+        spells = personal_spell_from_df(df_pre, cid, min_games=min_games_used) \
+                 or suggest_spells_for_champ(cid, id2tags, ally_ids, [])
 
         rows.append({
             "icon": id2icon.get(cid,""),
@@ -715,11 +768,12 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
             "개인_게임수": meta.get("games",0),
             "개인_승률(%)": round(meta.get("wr",0)*100,2) if pd.notna(meta.get("wr")) else None,
             "추천_스펠": " + ".join(spells),
-            "추천_룬": f"주{rune['primaryStyle']} · 부{rune['subStyle']} · 핵심{rune['keystone']}",
+            "추천_룬": f"주{rune['primaryStyle']} · 부{rune['SubStyle']} · 핵심{rune['keystone']}",
             "점수": score
         })
 
     out = pd.DataFrame(rows).sort_values("점수", ascending=False).reset_index(drop=True)
+
     st.subheader("후보 챔피언 추천 순위")
     top3 = out.head(3)
     cols = st.columns(len(top3))
@@ -730,5 +784,13 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
             st.write(f"예측 {r['예측승률α(%)']}%")
             st.write(f"스펠: {r['추천_스펠']}")
             st.write(r["추천_룬"])
+
     st.markdown("### 전체 표")
-    st.dataframe(out.drop(columns=["점수"]), use_container_width=True)
+    table = out.drop(columns=["점수"]).copy()
+    st.dataframe(
+        table,
+        column_config={
+            "icon": st.column_config.ImageColumn(" ", help="챔피언 아이콘", width="small")
+        },
+        use_container_width=True,
+    )
