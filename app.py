@@ -1,10 +1,12 @@
 # app.py
-# ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP) + 스크린샷 인식(β)
+# ARAM 픽창 개인화 추천 (내 2025 전적 + CompMLP) + 스크린샷 인식(β: 비율크롭+아이콘매칭)
 
 import os, io, re, json, requests, numpy as np, pandas as pd, streamlit as st, torch
 import torch.nn as nn
 from sklearn.preprocessing import OrdinalEncoder
 from PIL import Image
+import numpy as np
+from typing import List, Tuple, Dict
 
 # gdown (있으면 사용, 없으면 requests 폴백)
 try:
@@ -27,9 +29,9 @@ LANG = "ko_KR"
 LOCAL_MODEL_PATH = "model/pregame_mlp_comp.pt"  # 레포에 없으면 MODEL_URL로 다운로드
 os.makedirs("model", exist_ok=True)
 
-# ------------------------------------------------------------------
+# ==================================================================
 # Data Dragon 정적 정보 (챔피언/룬)
-# ------------------------------------------------------------------
+# ==================================================================
 @st.cache_data(show_spinner=False)
 def ddragon_latest_version():
     try:
@@ -82,9 +84,9 @@ def load_runes_static(lang=LANG):
 champ_df, id2name, id2icon, id2tags, name2id = load_champion_static()
 style_id2name, keystone_id2name = load_runes_static()
 
-# ------------------------------------------------------------------
+# ==================================================================
 # 체크포인트 모양을 그대로 복원하는 모델 로더 (크기 mismatch 방지)
-# ------------------------------------------------------------------
+# ==================================================================
 class CompMLP_Exact(nn.Module):
     """
     체크포인트(state_dict)에서 임베딩/레이어 차원을 읽어 '그대로' 복원.
@@ -387,9 +389,9 @@ def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
 
     return float(prob)
 
-# ------------------------------------------------------------------
+# ==================================================================
 # 내 전적 CSV 로드
-# ------------------------------------------------------------------
+# ==================================================================
 st.sidebar.header("1) 내 전적 CSV")
 csv_mode = st.sidebar.radio("불러오기 방식", ["GitHub RAW URL", "파일 업로드"], horizontal=True)
 df_pre = None
@@ -410,9 +412,9 @@ else:
         except Exception as e:
             st.sidebar.error(f"로드 실패: {e}")
 
-# ------------------------------------------------------------------
+# ==================================================================
 # 개인 성향/최빈 룬/스펠
-# ------------------------------------------------------------------
+# ==================================================================
 def build_personal_stats(df: pd.DataFrame):
     if df is None or len(df)==0:
         return pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
@@ -497,15 +499,19 @@ def comp_bonus_score(my_cid, ally_ids, id2tags):
     if "Marksman" in tags_me and ally_ad<=1: score += 0.03
     return min(score, 0.15)
 
-# ------------------------------------------------------------------
+# ==================================================================
 # [수동 입력] 픽창 UI
-# ------------------------------------------------------------------
+# ==================================================================
 st.markdown("## 3) 픽창 입력")
 c1, c2 = st.columns(2)
 with c1:
     ally_names = st.multiselect("아군 챔피언", champ_df["name"].tolist(), max_selections=4)
 with c2:
     enemy_names = st.multiselect("상대 챔피언 (선택)", champ_df["name"].tolist(), max_selections=5)
+
+# 세션에 저장(스크린샷 섹션에서 재사용)
+st.session_state["ally_names"] = ally_names
+st.session_state["enemy_names"] = enemy_names
 
 cand_names = st.multiselect("후보 챔피언 (선택)", champ_df["name"].tolist(), help="여기에 넣은 후보들만 점수화합니다.")
 alpha = st.slider("α 모델 가중치", 0.0, 1.0, 0.60, 0.01)
@@ -587,145 +593,141 @@ if st.button("🚀 추천 실행"):
             use_container_width=True,
         )
 
-# ------------------------------------------------------------------
-# 🖼️ 스크린샷 업로드 → 자동 인식 (Vertex AI)
-# ------------------------------------------------------------------
+# ==================================================================
+# 🧩 비율 좌표 크롭 + 아이콘 템플릿 매칭 (후보 5칸)
+# ==================================================================
 st.markdown("---")
-st.header("🖼️ 픽창 스크린샷으로 자동 추천 (β)")
+st.header("🖼️ 픽창 스크린샷으로 자동 추천 (β · 비율크롭)")
 
-def init_vertex():
+# ── 1) 후보 바 비율 파라미터 (슬라이더로 즉시 튜닝)
+with st.sidebar.expander("후보 바 비율(상단 5칸) 튜닝", expanded=False):
+    bar_x0_ratio = st.slider("bar_x0_ratio", 0.00, 1.00, 0.18, 0.001)
+    bar_x1_ratio = st.slider("bar_x1_ratio", 0.00, 1.00, 0.82, 0.001)
+    bar_y0_ratio = st.slider("bar_y0_ratio", 0.00, 1.00, 0.08, 0.001)
+    bar_y1_ratio = st.slider("bar_y1_ratio", 0.00, 1.00, 0.18, 0.001)
+    col_gap_ratio= st.slider("col_gap_ratio",0.000,0.050,0.008, 0.001)
+    icon_match_size = st.slider("아이콘 매칭 크기(px)", 32, 128, 64, 16)
+
+class CandidateBarConfig:
+    def __init__(self, x0, x1, y0, y1, gap):
+        self.bar_x0_ratio = x0
+        self.bar_x1_ratio = x1
+        self.bar_y0_ratio = y0
+        self.bar_y1_ratio = y1
+        self.col_gap_ratio = gap
+
+def auto_trim_letterbox(img: Image.Image, thresh: int = 8) -> Image.Image:
+    arr = np.asarray(img.convert("L"))
+    H, W = arr.shape
+    top = 0
+    while top < H and arr[top].mean() < thresh: top += 1
+    bot = H - 1
+    while bot > top and arr[bot].mean() < thresh: bot -= 1
+    left = 0
+    while left < W and arr[:, left].mean() < thresh: left += 1
+    right = W - 1
+    while right > left and arr[:, right].mean() < thresh: right -= 1
+    if right - left < W * 0.5 or bot - top < H * 0.5:
+        return img
+    return img.crop((left, top, right + 1, bot + 1))
+
+def crop_candidate_slots(img: Image.Image, cfg: CandidateBarConfig) -> List[Image.Image]:
+    base = auto_trim_letterbox(img)
+    W, H = base.size
+    bar_x0 = int(round(W * cfg.bar_x0_ratio))
+    bar_x1 = int(round(W * cfg.bar_x1_ratio))
+    bar_y0 = int(round(H * cfg.bar_y0_ratio))
+    bar_y1 = int(round(H * cfg.bar_y1_ratio))
+    bar_w  = max(1, bar_x1 - bar_x0)
+    gap_px = int(round(W * cfg.col_gap_ratio))
+    total_gap = gap_px * 4
+    slot_w = max(1, (bar_w - total_gap) // 5)
+    slots = []
+    cur_x = bar_x0
+    for _ in range(5):
+        x0 = cur_x
+        x1 = x0 + slot_w
+        y0 = bar_y0
+        y1 = bar_y1
+        slots.append(base.crop((x0, y0, x1, y1)))
+        cur_x = x1 + gap_px
+    return slots
+
+# ── 2) DDragon 아이콘을 내려받아 매칭용 배열로 캐시
+@st.cache_data(show_spinner=False)
+def _download_icon_as_arr(url: str, size: int = 64):
     try:
-        import vertexai
-        from vertexai.generative_models import GenerativeModel
-    except Exception as e:
-        st.error(f"Vertex AI 라이브러리가 없습니다: {e}")
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        im = Image.open(io.BytesIO(r.content)).convert("RGB").resize((size, size))
+        arr = np.asarray(im).astype(np.float32) / 255.0
+        return arr
+    except Exception:
         return None
 
-    proj = st.secrets.get("GCP_PROJECT", "")
-    loc  = st.secrets.get("GCP_LOCATION", "us-central1")
-    sa_raw = st.secrets.get("GCP_SA_JSON", "")
-    if not (proj and sa_raw):
-        st.info("Secrets에 GCP_PROJECT, GCP_LOCATION, GCP_SA_JSON을 설정하세요.")
-        return None
+@st.cache_data(show_spinner=True)
+def build_icon_bank(size: int = 64) -> Dict[str, np.ndarray]:
+    bank = {}
+    for r in champ_df.itertuples():
+        arr = _download_icon_as_arr(id2icon.get(r.championId, ""), size=size)
+        if arr is not None:
+            bank[r.name] = arr
+    return bank
 
-    try:
-        sa_obj = json.loads(sa_raw)
-    except Exception as e:
-        st.error(f"GCP_SA_JSON 파싱 실패: {e}")
-        return None
+def mse(a: np.ndarray, b: np.ndarray) -> float:
+    # 두 배열 모양이 다르면 즉시 큰 값 반환
+    if a.shape != b.shape:
+        return 1e9
+    diff = (a - b)
+    return float(np.mean(diff * diff))
 
-    key_path = "/tmp/gcp_key.json"
-    with open(key_path, "w", encoding="utf-8") as f:
-        json.dump(sa_obj, f)
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = key_path
+def predict_champion_from_icon(crop_img: Image.Image, bank: Dict[str, np.ndarray], size: int = 64):
+    """간단 템플릿 매칭(MSE). 필요시 SSIM/임베딩으로 교체 가능."""
+    arr = np.asarray(crop_img.convert("RGB").resize((size, size))).astype(np.float32) / 255.0
+    best_name, best_dist = None, 1e9
+    for name, icon_arr in bank.items():
+        d = mse(arr, icon_arr)
+        if d < best_dist:
+            best_dist = d
+            best_name = name
+    # 신뢰도 스케일(경험적): 0~0.1 구간을 1.0~0.0로 역변환
+    conf = max(0.0, 1.0 - min(best_dist, 0.1) / 0.1)
+    return best_name, conf
 
-    import vertexai
-    vertexai.init(project=proj, location=loc)
-    from vertexai.generative_models import GenerativeModel
-
-    prefer = st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash-002")
-    candidates = [prefer, "gemini-2.5-flash-lite-001", "gemini-2.0-flash-001",
-                  "gemini-1.5-flash-002", "gemini-1.0-pro-vision-001"]
-
-    last_err = None
-    for m in candidates:
-        try:
-            model = GenerativeModel(m)
-            test = model.generate_content(["ping"], generation_config={"max_output_tokens": 1})
-            if not getattr(test, "candidates", None):
-                raise RuntimeError("모델 응답이 비어있음")
-            st.caption(f"Using Gemini model: **{m}**")
-            return model
-        except Exception as e:
-            last_err = e
-            continue
-
-    st.error(f"Gemini 모델 접근 실패: {last_err}")
-    st.info("• 프로젝트/리전(us-central1)/역할(roles:aiplatform.user)/결제 활성화 여부를 확인하세요.")
-    return None
-
-def _names_to_ids(names):
-    return [int(name2id[n]) for n in names if n in name2id]
-
-up_img = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"])
-if up_img and st.button("🔍 스샷 인식 & 추천"):
-    img = Image.open(up_img).convert("RGB")
+up_img2 = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png","jpg","jpeg"], key="ratio_uploader")
+if up_img2 and st.button("🔍 스샷 인식 & 추천 (비율크롭)"):
+    img = Image.open(up_img2).convert("RGB")
     st.image(img, caption="입력 이미지", use_container_width=True)
 
-    model = init_vertex()
-    if model is None:
+    cfg = CandidateBarConfig(bar_x0_ratio, bar_x1_ratio, bar_y0_ratio, bar_y1_ratio, col_gap_ratio)
+    slots = crop_candidate_slots(img, cfg)
+
+    cols = st.columns(5)
+    for i, cimg in enumerate(slots):
+        with cols[i]:
+            st.image(cimg, caption=f"후보 {i+1}", use_container_width=True)
+
+    bank = build_icon_bank(size=icon_match_size)
+    cand_names_detected = []
+    for cimg in slots:
+        name, conf = predict_champion_from_icon(cimg, bank, size=icon_match_size)
+        if name and name in name2id and conf >= 0.35:  # 너무 낮으면 버림
+            cand_names_detected.append(name)
+
+    # 중복 제거, 최대 5개
+    cand_names_detected = list(dict.fromkeys(cand_names_detected))[:5]
+    st.write("인식된 후보:", cand_names_detected if cand_names_detected else "없음")
+
+    # 아군은 '수동 입력' 섹션의 선택을 사용
+    ally_names_ss = st.session_state.get("ally_names", [])
+    enemy_names_ss = st.session_state.get("enemy_names", [])
+
+    if len(ally_names_ss) != 4 or not cand_names_detected:
+        st.warning("아군 4명 선택(상단 '픽창 입력' 섹션) 및 후보 인식이 필요합니다.")
         st.stop()
 
-    from vertexai.generative_models import Part
-    sys_prompt = (
-        "You extract ARAM pick-phase info from screenshots. "
-        "Return STRICT JSON with keys: ally_champions (string[]), candidate_champions (string[]). "
-        "Names must be Korean exactly as shown in the League client. "
-        "The candidate_champions must be ONLY those shown in the top 'available champs' slots (max 5). "
-        "If not visible, use an empty array. JSON only."
-    )
-    user_prompt = (
-        "이 이미지는 무작위 총력전(ARAM) 픽창입니다. 왼쪽의 아군 4명과 상단 후보 챔피언을 읽어 "
-        "다음 JSON 형식으로만 출력하세요.\n"
-        "{\n"
-        '  "ally_champions": ["초가스","타릭","벨베스","요네"],\n'
-        '  "candidate_champions": ["다이애나","럭스","제드"]\n'
-        "}\n"
-    )
-    buf = io.BytesIO(); img.save(buf, format="PNG")
-
-    resp = model.generate_content(
-        [sys_prompt, Part.from_data(mime_type="image/png", data=buf.getvalue()), user_prompt],
-        generation_config={"temperature": 0.1, "max_output_tokens": 512},
-    )
-
-    # ---- 응답 문자열 안전 추출 ----
-    raw = ""
-    if hasattr(resp, "text") and resp.text:
-        raw = resp.text
-    elif getattr(resp, "candidates", None):
-        parts = []
-        for c in resp.candidates:
-            try:
-                for p in getattr(c, "content", {}).parts or []:
-                    if getattr(p, "text", None):
-                        parts.append(p.text)
-            except Exception:
-                pass
-        raw = "\n".join([p for p in parts if p])
-    raw = (raw or "").strip()
-
-    if not raw:
-        st.error("모델 응답이 비었습니다. (인증/권한/리전/모델명을 다시 확인)")
-        st.stop()
-
-    # ---- JSON만 추출 ----
-    m = re.search(r"\{[\s\S]*\}", raw)
-    if not m:
-        st.error("응답에서 JSON 블록을 찾지 못했습니다. 프롬프트를 다시 보내 보세요.")
-        st.code(raw, language="markdown")
-        st.stop()
-
-    json_str = m.group(0)
-    try:
-        data = json.loads(json_str)
-    except Exception as e:
-        st.error(f"JSON 파싱 실패: {e}")
-        st.code(json_str, language="json")
-        st.stop()
-
-    st.subheader("인식 결과")
-    st.code(json.dumps(data, ensure_ascii=False, indent=2), language="json")
-
-    ally_ids = _names_to_ids(data.get("ally_champions", []))
-    cand_ids = _names_to_ids(data.get("candidate_champions", []))
-
-    # 후보 정제: 중복 제거, 최대 5개로 제한
-    cand_ids = list(dict.fromkeys(cand_ids))[:5]
-
-    if len(ally_ids) != 4 or not cand_ids:
-        st.info("아군 4명 또는 후보가 충분히 인식되지 않았습니다. 이미지 해상도/밝기를 높여 다시 시도해 주세요.")
-        st.stop()
+    ally_ids = [name2id[n] for n in ally_names_ss]
+    enemy_ids = [name2id[n] for n in enemy_names_ss] if enemy_names_ss else []
 
     per = build_personal_stats(df_pre) if df_pre is not None else pd.DataFrame(columns=["championId","games","wins","wr","personal_score"])
     per_map = per.set_index("championId").to_dict(orient="index") if len(per)>0 else {}
@@ -737,10 +739,10 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     min_games_used = st.session_state.get("min_games", 5)
 
     rows = []
-    for cid in cand_ids:
-        cname = id2name.get(cid, str(cid))
+    for cname in cand_names_detected:
+        cid = name2id[cname]
         meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
-        ps   = meta["personal_score"] - (0.3 if meta["games"]<5 else 0.0)
+        ps   = meta["personal_score"] - (0.3 if meta["games"]<min_games_used else 0.0)
 
         mode = misc_modes.get(cid, {})
         misc_row = {
@@ -750,13 +752,13 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
             "keystone": str(mode.get("keystone","__UNK__")),
             "patch": str(mode.get("patch","__UNK__")),
         }
-        prob  = predict_prob_comp(bundle, cid, ally_ids, [], misc_row)
+        prob  = predict_prob_comp(bundle, cid, ally_ids, enemy_ids, misc_row)
         bonus = comp_bonus_score(cid, ally_ids, id2tags)
         score = alpha*prob + beta*ps + gamma*bonus
 
         rune = suggest_runes_from_modes(cid, misc_modes)
         spells = personal_spell_from_df(df_pre, cid, min_games=min_games_used) \
-                 or suggest_spells_for_champ(cid, id2tags, ally_ids, [])
+                 or suggest_spells_for_champ(cid, id2tags, ally_ids, enemy_ids)
 
         rows.append({
             "icon": id2icon.get(cid,""),
