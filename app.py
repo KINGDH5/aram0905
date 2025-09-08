@@ -365,37 +365,41 @@ class CandidateBarConfig:
         self.col_gap_ratio=gap; self.slots=int(slots)
         self.x_shift=x_shift; self.y_shift=y_shift; self.w_scale=w_scale; self.h_scale=h_scale
 
-def auto_trim_letterbox(img: Image.Image, thresh: int=8)->Image.Image:
-    arr=np.asarray(img.convert("L")); H,W=arr.shape
-    top=0;   while top<H and arr[top].mean()<thresh: top+=1
-    bot=H-1; while bot>top and arr[bot].mean()<thresh: bot-=1
-    left=0;  while left<W and arr[:,left].mean()<thresh: left+=1
-    right=W-1; 
-    while right>left and arr[:,right].mean()<thresh: right-=1
-    if right-left < W*0.5 or bot-top < H*0.5: return img
-    return img.crop((left,top,right+1,bot+1))
+def auto_trim_letterbox(img: Image.Image, thresh: int = 8) -> Image.Image:
+    """
+    유튜브 플레이어 여백(완전 검은 띠)을 자동으로 잘라냅니다.
+    이미지 가장자리에서 평균 밝기가 'thresh' 미만인 라인을 걷어냄.
+    여백이 거의 없으면 원본을 그대로 반환.
+    """
+    arr = np.asarray(img.convert("L"))
+    H, W = arr.shape
 
-def _apply_adjust(x0r,x1r,y0r,y1r,xs,ys,ws,hs):
-    cx=(x0r+x1r)/2; cy=(y0r+y1r)/2; w=(x1r-x0r)*ws; h=(y1r-y0r)*hs
-    nx0=cx-w/2+xs; nx1=cx+w/2+xs; ny0=cy-h/2+ys; ny1=cy+h/2+ys
-    return max(0.0,nx0), min(1.0,nx1), max(0.0,ny0), min(1.0,ny1)
+    # 위쪽
+    top = 0
+    while top < H and arr[top].mean() < thresh:
+        top += 1
 
-def crop_candidate_slots(img:Image.Image, cfg:CandidateBarConfig)->Tuple[Image.Image,List[Image.Image],List[Tuple[int,int,int,int]]]:
-    base=auto_trim_letterbox(img); W,H=base.size
-    x0r,x1r,y0r,y1r=_apply_adjust(cfg.bar_x0_ratio,cfg.bar_x1_ratio,cfg.bar_y0_ratio,cfg.bar_y1_ratio,
-                                  cfg.x_shift,cfg.y_shift,cfg.w_scale,cfg.h_scale)
-    x0=int(round(W*x0r)); x1=int(round(W*x1r))
-    y0=int(round(H*y0r)); y1=int(round(H*y1r))
-    bar_w=max(1, x1-x0)
-    gap=int(round(W*cfg.col_gap_ratio))
-    total_gap=gap*(cfg.slots-1)
-    slot_w=max(1, (bar_w - total_gap)//cfg.slots)
-    slots=[]; rects=[]; cur=x0
-    for _ in range(cfg.slots):
-        r=(cur, y0, cur+slot_w, y1)
-        rects.append(r); slots.append(base.crop(r))
-        cur = r[2] + gap
-    return base, slots, rects
+    # 아래쪽
+    bot = H - 1
+    while bot > top and arr[bot].mean() < thresh:
+        bot -= 1
+
+    # 왼쪽
+    left = 0
+    while left < W and arr[:, left].mean() < thresh:
+        left += 1
+
+    # 오른쪽
+    right = W - 1
+    while right > left and arr[:, right].mean() < thresh:
+        right -= 1
+
+    # 잘라낼 영역이 너무 작으면(오탐) 원본 유지
+    if (right - left) < W * 0.5 or (bot - top) < H * 0.5:
+        return img
+
+    return img.crop((left, top, right + 1, bot + 1))
+
 
 def draw_overlay(img:Image.Image, rects:list[tuple[int,int,int,int]]):
     im=img.copy(); dr=ImageDraw.Draw(im, "RGBA")
