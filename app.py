@@ -217,6 +217,7 @@ def _infer_model_from_state(sd):
     )
 
 def enc_misc_row(enc: OrdinalEncoder, row: dict):
+    # enc.transform에 넣을 2차원 배열 (배치=1)
     vals = [[
         row.get("spell_pair", "__UNK__"),
         row.get("primaryStyle", "__UNK__"),
@@ -606,8 +607,12 @@ def _apply_adjust(x0r, x1r, y0r, y1r, xs, ys, ws, hs):
     ny0=max(0.0, cy-h/2+ys); ny1=min(1.0, cy+h/2+ys)
     return nx0, nx1, ny0, ny1
 
-def crop_candidate_slots(img: Image.Image, cfg: CandidateBarConfig) -> Tuple[Image.Image, List[Image.Image], List[Tuple[int,int,int,int]]]:
-    base = auto_trim_letterbox(img)
+def crop_candidate_slots(
+    img: Image.Image,
+    cfg: CandidateBarConfig,
+    use_trim: bool = False,   # ← 레터박스 트림 토글 (기본 OFF)
+) -> Tuple[Image.Image, List[Image.Image], List[Tuple[int,int,int,int]]]:
+    base = auto_trim_letterbox(img) if use_trim else img
     W, H = base.size
     x0r,x1r,y0r,y1r = _apply_adjust(cfg.bar_x0_ratio,cfg.bar_x1_ratio,cfg.bar_y0_ratio,cfg.bar_y1_ratio,
                                     cfg.x_shift,cfg.y_shift,cfg.w_scale,cfg.h_scale)
@@ -764,10 +769,21 @@ st.header("🖼️ 스크린샷 자동 추천 (팀 자동 + 후보칸 비율크�
 
 with st.sidebar.expander("후보칸 레이아웃/비율 튜닝", expanded=True):
     layout = st.selectbox("레이아웃", ["상단 10칸(작은 정사각형)", "중앙 5칸(스킨 줄)"])
+    # ✅ 네 스샷 기준 프리셋 (상단 10칸) — 오른쪽/아래로 치우치던 것 보정
     if layout == "상단 10칸(작은 정사각형)":
-        defaults = dict(x0=0.37, x1=0.86, y0=0.060, y1=0.118, gap=0.008, slots=10)
+        defaults = dict(
+            x0=0.300,  # 더 왼쪽에서 시작
+            x1=0.940,  # 더 오른쪽까지
+            y0=0.078,  # 살짝 아래
+            y1=0.128,  # 높이 보정
+            gap=0.008,
+            slots=10
+        )
     else:
+        # 중앙 5칸(스킨 썸바) 대략 프리셋
         defaults = dict(x0=0.335, x1=0.735, y0=0.072, y1=0.132, gap=0.012, slots=5)
+
+    use_trim = st.checkbox("레터박스(검은 띠) 자동 제거", value=False)  # 토글 추가
 
     bar_x0_ratio = st.slider("x0", 0.00, 1.00, defaults["x0"], 0.001)
     bar_x1_ratio = st.slider("x1", 0.00, 1.00, defaults["x1"], 0.001)
@@ -786,13 +802,14 @@ up_img = st.file_uploader("픽창 스크린샷 업로드 (PNG/JPG)", type=["png"
 if up_img and st.button("🔍 스샷 인식 & 추천 (팀 자동 + 후보칸)"):
     img = Image.open(up_img).convert("RGB")
 
-    # 1) 후보칸 인식
+    # 1) 후보칸 인식 (오버레이 확인)
     cfg = CandidateBarConfig(bar_x0_ratio, bar_x1_ratio, bar_y0_ratio, bar_y1_ratio,
                              col_gap_ratio, slots=slot_count,
                              x_shift=x_shift, y_shift=y_shift, w_scale=w_scale, h_scale=h_scale)
-    base, crops, rects = crop_candidate_slots(img, cfg)
+    base, crops, rects = crop_candidate_slots(img, cfg, use_trim=use_trim)
     st.image(draw_overlay(base, rects), caption=f"후보칸 오버레이 (칸수={slot_count})", use_container_width=True)
 
+    # 2) 후보칸 아이콘 매칭
     bank = build_icon_bank(size=icon_match_size)
     cand_names = []
     for c in crops:
@@ -804,7 +821,7 @@ if up_img and st.button("🔍 스샷 인식 & 추천 (팀 자동 + 후보칸)"):
         st.warning("후보칸 인식 실패: 비율/간격 슬라이더를 조금 조정해 보세요.")
         st.stop()
 
-    # 2) 아군 자동 인식(Gemini) → 실패 시 폴백
+    # 3) 아군 자동 인식(Gemini) → 실패 시 폴백(수동)
     ally_auto = detect_allies_from_gemini(img)
     if ally_auto and len(ally_auto) >= 4:
         ally_names = ally_auto[:4]
@@ -817,7 +834,7 @@ if up_img and st.button("🔍 스샷 인식 & 추천 (팀 자동 + 후보칸)"):
 
     enemy_names = enemy_names_manual or []
 
-    # 3) 추천 계산
+    # 4) 추천 계산
     ally_ids  = [name2id[n] for n in ally_names]
     enemy_ids = [name2id[n] for n in enemy_names] if enemy_names else []
 
