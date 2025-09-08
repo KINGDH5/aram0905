@@ -108,50 +108,45 @@ class CompMLP_Exact(nn.Module):
         # MLP
         if use_dropout:
             self.mlp = nn.Sequential(
-                nn.Linear(in_dim, h1),  # 0
-                nn.ReLU(),              # 1
-                nn.Dropout(0.2),        # 2
-                nn.Linear(h1, h2),      # 3
-                nn.ReLU(),              # 4
-                nn.Linear(h2, 1),       # 5
+                nn.Linear(in_dim, h1),
+                nn.ReLU(),
+                nn.Dropout(0.2),
+                nn.Linear(h1, h2),
+                nn.ReLU(),
+                nn.Linear(h2, 1),
             )
         else:
             self.mlp = nn.Sequential(
-                nn.Linear(in_dim, h1),  # 0
-                nn.ReLU(),              # 1
-                nn.Linear(h1, h2),      # 2
-                nn.ReLU(),              # 3
-                nn.Linear(h2, 1),       # 4
+                nn.Linear(in_dim, h1),
+                nn.ReLU(),
+                nn.Linear(h1, h2),
+                nn.ReLU(),
+                nn.Linear(h2, 1),
             )
 
     def forward(self, my_idx, ally_lists, enem_lists, misc_idx):
-        # ----- 임베딩 모음 -----
-        me = self.emb_champ(my_idx)  # [B, d_champ]
+        me = self.emb_champ(my_idx)
 
-        # allies/enemies 개수 정확히 맞추기(패딩/트렁케이트)
         allies = [self.emb_champ(a) for a in ally_lists[: self.n_allies]]
         for _ in range(max(0, self.n_allies - len(allies))):
-            allies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
+            allies.append(self.emb_champ(torch.zeros_like(my_idx)))
 
         enemies = [self.emb_champ(e) for e in enem_lists[: self.n_enemies]]
         for _ in range(max(0, self.n_enemies - len(enemies))):
-            enemies.append(self.emb_champ(torch.zeros_like(my_idx)))  # index 0 패딩
+            enemies.append(self.emb_champ(torch.zeros_like(my_idx)))
 
-        # misc 5종(순서 고정)
         sp  = self.emb_sp(misc_idx[:, 0])
         pri = self.emb_pri(misc_idx[:, 1])
         sub = self.emb_sub(misc_idx[:, 2])
         key = self.emb_key(misc_idx[:, 3])
         pat = self.emb_pat(misc_idx[:, 4])
-        misc = torch.cat([sp, pri, sub, key, pat], dim=-1)  # [B, misc_sum]
+        misc = torch.cat([sp, pri, sub, key, pat], dim=-1)
 
-        # ----- 실제 입력 벡터 -----
-        x = torch.cat([me, *allies, *enemies, misc], dim=-1)  # [B, cur_dim]
+        x = torch.cat([me, *allies, *enemies, misc], dim=-1)
 
-        # ===== 안전 가드: in_features와 정확히 맞추기 =====
+        # 입력 차원 보정 (예방)
         try:
-            first_linear = self.mlp[0]
-            expect = int(first_linear.in_features)
+            expect = int(self.mlp[0].in_features)
         except Exception:
             expect = None
             for mod in self.mlp:
@@ -178,7 +173,7 @@ class CompMLP_Exact(nn.Module):
         return self.mlp(x).squeeze(-1)
 
 def _infer_model_from_state(sd):
-    # --- 임베딩 모양 ---
+    # 임베딩 모양
     n_champ, d_champ = sd["emb_champ.weight"].shape
     n_sp, d_sp   = sd["emb_sp.weight"].shape
     n_pri, d_pri = sd["emb_pri.weight"].shape
@@ -186,7 +181,7 @@ def _infer_model_from_state(sd):
     n_key, d_key = sd["emb_key.weight"].shape
     n_pat, d_pat = sd["emb_pat.weight"].shape
 
-    # --- MLP 크기/드롭아웃 ---
+    # MLP 크기/드롭아웃
     in_dim = sd["mlp.0.weight"].shape[1]
     h1     = sd["mlp.0.weight"].shape[0]
     use_dropout = ("mlp.3.weight" in sd and "mlp.2.weight" not in sd)
@@ -376,20 +371,17 @@ def predict_prob_comp(bundle, my_cid, ally_ids, enemy_ids, misc_row):
             ids.append(0)
         return ids
 
-    # 1차원 [1] 텐서
-    my = torch.tensor([c2i.get(int(my_cid), unk_idx)], dtype=torch.long).to(device)  # [1]
-    ally = torch.tensor([c2i.get(i, unk_idx) for i in pad(ally_ids, na)], dtype=torch.long)  # [na]
-    ally = ally.unsqueeze(0).to(device)  # [1, na]
-    enem = torch.tensor([c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)], dtype=torch.long) # [ne]
-    enem = enem.unsqueeze(0).to(device)  # [1, ne]
-    misc = enc_misc_row(enc, misc_row).to(device)                                           # [1, 5]
+    my = torch.tensor([c2i.get(int(my_cid), unk_idx)], dtype=torch.long).to(device)
+    ally = torch.tensor([c2i.get(i, unk_idx) for i in pad(ally_ids, na)], dtype=torch.long).unsqueeze(0).to(device)
+    enem = torch.tensor([c2i.get(i, unk_idx) for i in pad(enemy_ids, ne)], dtype=torch.long).unsqueeze(0).to(device)
+    misc = enc_misc_row(enc, misc_row).to(device)
 
     with torch.no_grad():
         out = model(
-            my,                               # [1]
-            [ally[:, i] for i in range(ally.shape[1])],   # 각 원소는 [1]
-            [enem[:, i] for i in range(enem.shape[1])],   # 각 원소는 [1]
-            misc                              # [1, 5]
+            my,
+            [ally[:, i] for i in range(ally.shape[1])],
+            [enem[:, i] for i in range(enem.shape[1])],
+            misc
         )
         prob = torch.sigmoid(out).cpu().item()
 
@@ -414,7 +406,7 @@ else:
     if up:
         try:
             df_pre = pd.read_csv(up)
-            st.sidebar.success(f"CSV 로드: {len[df_pre]}행")
+            st.sidebar.success(f"CSV 로드: {len(df_pre)}행")
         except Exception as e:
             st.sidebar.error(f"로드 실패: {e}")
 
@@ -668,7 +660,9 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     sys_prompt = (
         "You extract ARAM pick-phase info from screenshots. "
         "Return STRICT JSON with keys: ally_champions (string[]), candidate_champions (string[]). "
-        "Names must be Korean exactly as shown in the League client. If not visible, return empty arrays. JSON only."
+        "Names must be Korean exactly as shown in the League client. "
+        "The candidate_champions must be ONLY those shown in the top 'available champs' slots (max 5). "
+        "If not visible, use an empty array. JSON only."
     )
     user_prompt = (
         "이 이미지는 무작위 총력전(ARAM) 픽창입니다. 왼쪽의 아군 4명과 상단 후보 챔피언을 읽어 "
@@ -726,6 +720,9 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
     ally_ids = _names_to_ids(data.get("ally_champions", []))
     cand_ids = _names_to_ids(data.get("candidate_champions", []))
 
+    # 후보 정제: 중복 제거, 최대 5개로 제한
+    cand_ids = list(dict.fromkeys(cand_ids))[:5]
+
     if len(ally_ids) != 4 or not cand_ids:
         st.info("아군 4명 또는 후보가 충분히 인식되지 않았습니다. 이미지 해상도/밝기를 높여 다시 시도해 주세요.")
         st.stop()
@@ -741,7 +738,7 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
 
     rows = []
     for cid in cand_ids:
-        cname = id2name.get(cid, str(cid])
+        cname = id2name.get(cid, str(cid))
         meta = per_map.get(cid, {"games":0,"wins":0,"wr":np.nan,"personal_score":-0.5})
         ps   = meta["personal_score"] - (0.3 if meta["games"]<5 else 0.0)
 
@@ -768,7 +765,7 @@ if up_img and st.button("🔍 스샷 인식 & 추천"):
             "개인_게임수": meta.get("games",0),
             "개인_승률(%)": round(meta.get("wr",0)*100,2) if pd.notna(meta.get("wr")) else None,
             "추천_스펠": " + ".join(spells),
-            "추천_룬": f"주{rune['primaryStyle']} · 부{rune['SubStyle']} · 핵심{rune['keystone']}",
+            "추천_룬": f"주{rune['primaryStyle']} · 부{rune['subStyle']} · 핵심{rune['keystone']}",
             "점수": score
         })
 
